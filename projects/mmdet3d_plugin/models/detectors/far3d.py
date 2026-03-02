@@ -219,6 +219,10 @@ class Far3D(MVXTwoStageDetector):
         rec_img_feats, depths = self.extract_feat(rec_img, True)
 
         data['img_feats'] = rec_img_feats
+        # if img_metas contains double lists([[]]]), remove it
+        if isinstance(img_metas[0], list):
+            img_metas = [meta[0] for meta in img_metas]
+        
         losses = self.forward_pts_train(gt_bboxes_3d,
                                     gt_labels_3d, gt_bboxes,
                                     gt_labels, img_metas, centers2d, depths, **data)

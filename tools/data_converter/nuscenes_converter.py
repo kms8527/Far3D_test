@@ -706,3 +706,22 @@ def generate_record(ann_rec: dict, x1: float, y1: float, x2: float, y2: float,
     coco_rec['visibility_token'] = repro_rec['visibility_token']
 
     return coco_rec
+
+if __name__ == '__main__':
+    import argparse
+
+    parser = argparse.ArgumentParser(description='NuScenes info generator')
+    parser.add_argument('--root_path', type=str, default='/mnt/nas/nuscean/nuscenes', help='Root path of the NuScenes dataset')
+    parser.add_argument(
+        '--version',
+        default='v1.0-trainval',
+        choices=['v1.0-trainval', 'v1.0-test', 'v1.0-mini'],
+        help='Version of NuScenes dataset')
+    parser.add_argument(
+        '--max_sweeps',
+        type=int,
+        default=10,
+        help='Max number of sweeps to be included in info file')
+    args = parser.parse_args()
+    create_nuscenes_infos(args.root_path, 'nuscenes_temporal', args.version,
+                          args.max_sweeps)

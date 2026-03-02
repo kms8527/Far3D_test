@@ -584,9 +584,27 @@ class YOLOXHeadCustom(BaseDenseHead, BBoxTestMixin):
         flatten_bboxes = self._bbox_decode(flatten_priors, flatten_bbox_preds)
         # flatten_centers2d = self._centers2d_decode(flatten_priors, flatten_centers2d_offset)
 
-        gt_bboxes = [bboxes2d for i in gt_bboxes2d_list for bboxes2d in i]
-        gt_labels = [labels2d for i in gt_labels2d_list for labels2d in i]
-        centers2d = [center2d for i in centers2d for center2d in i]
+        def _flatten_nested(seq):
+            flat = []
+            stack = list(seq)
+            while stack:
+                item = stack.pop(0)
+                if isinstance(item, (list, tuple)):
+                    stack = list(item) + stack
+                else:
+                    flat.append(item)
+            return flat
+
+        gt_bboxes = _flatten_nested(gt_bboxes2d_list)
+        gt_labels = _flatten_nested(gt_labels2d_list)
+        centers2d = _flatten_nested(centers2d)
+
+        if len(gt_bboxes) != num_imgs or len(gt_labels) != num_imgs or len(centers2d) != num_imgs:
+            raise RuntimeError(
+                f'2D target count mismatch: num_imgs={num_imgs}, '
+                f'len(gt_bboxes)={len(gt_bboxes)}, '
+                f'len(gt_labels)={len(gt_labels)}, '
+                f'len(centers2d)={len(centers2d)}')
 
         # (pos_masks, cls_targets, obj_targets, bbox_targets, l1_targets,
         (pos_masks, cls_targets, obj_targets, bbox_targets, l1_targets, centers2d_target,
@@ -696,7 +714,25 @@ class YOLOXHeadCustom(BaseDenseHead, BBoxTestMixin):
                 with shape [num_gts].
         """
 
+
+
         num_priors = priors.size(0)
+        
+        # data list to tensor
+        if isinstance(gt_labels, torch.Tensor):
+            gt_labels = gt_labels.reshape(-1)
+        else:
+            gt_labels = torch.cat(gt_labels)
+        if isinstance(gt_bboxes, torch.Tensor):
+            gt_bboxes = gt_bboxes.reshape(-1, 4)
+        else:
+            gt_bboxes = torch.cat(gt_bboxes)
+        if isinstance(centers2d, torch.Tensor):
+            centers2d = centers2d.reshape(-1, 2)
+        else:
+            centers2d = torch.cat(centers2d)
+        # if isinstance(gt_labels[0], list):
+        #     gt_labels = [tmp[0] for tmp in gt_labels]
         num_gts = gt_labels.size(0)
         gt_bboxes = gt_bboxes.to(decoded_bboxes.dtype)
         centers2d = centers2d.to(decoded_bboxes.dtype)

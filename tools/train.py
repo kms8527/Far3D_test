@@ -181,8 +181,9 @@ def main():
         logger_name = 'mmseg'
     else:
         logger_name = 'mmdet'
+    log_level = cfg.get('log_level', 'INFO')
     logger = get_root_logger(
-        log_file=log_file, log_level=cfg.log_level, name=logger_name)
+        log_file=log_file, log_level=log_level, name=logger_name)
 
     # init the meta dict to record some important information such as
     # environment info and seed, which will be logged

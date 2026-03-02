@@ -7,22 +7,20 @@ plugin_dir='projects/mmdet3d_plugin/'
 
 # If point cloud range is changed, the models should also change their point
 # cloud range accordingly
-point_cloud_range = [-152.4, -152.4, -5.0, 152.4, 152.4, 5.0]
+point_cloud_range = [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
 
 voxel_size = [0.2, 0.2, 8]
 img_norm_cfg = dict(
     mean=[103.530, 116.280, 123.675], std=[57.375, 57.120, 58.395], to_rgb=False)
-class_names = ['ARTICULATED_BUS', 'BICYCLE', 'BICYCLIST', 'BOLLARD', 'BOX_TRUCK', 'BUS',
-               'CONSTRUCTION_BARREL', 'CONSTRUCTION_CONE', 'DOG', 'LARGE_VEHICLE',
-               'MESSAGE_BOARD_TRAILER', 'MOBILE_PEDESTRIAN_CROSSING_SIGN', 'MOTORCYCLE',
-               'MOTORCYCLIST', 'PEDESTRIAN', 'REGULAR_VEHICLE', 'SCHOOL_BUS', 'SIGN',
-               'STOP_SIGN', 'STROLLER', 'TRUCK', 'TRUCK_CAB', 'VEHICULAR_TRAILER',
-               'WHEELCHAIR', 'WHEELED_DEVICE','WHEELED_RIDER']
+class_names = [
+    'car', 'truck', 'construction_vehicle', 'bus', 'trailer',
+    'barrier', 'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'
+]
 
 num_gpus = 8
 batch_size = 1
-num_iters_per_epoch = 110071 // (num_gpus * batch_size) 
-num_epochs = 6
+num_iters_per_epoch = 28130 // (num_gpus * batch_size)
+num_epochs = 24
 embed_dims=256
 
 queue_length = 1
@@ -57,7 +55,7 @@ model = dict(
         num_outs=4),
     img_roi_head=dict(
         type='YOLOXHeadCustom',
-        num_classes=26,
+        num_classes=10,
         in_channels=256,
         strides=[8, 16, 32, 64],
         train_cfg=dict(assigner=dict(type='SimOTAAssigner', center_radius=2.5)),
@@ -74,7 +72,7 @@ model = dict(
     ),
     pts_bbox_head=dict(
         type='FarHead',
-        num_classes=26,
+        num_classes=10,
         in_channels=256,
         num_query=644,
         memory_len=1024,
@@ -98,7 +96,7 @@ model = dict(
         return_bbox2d_scores=True,
         return_context_feat=True,
         code_size=8,
-        code_weights = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        code_weights = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.2, 0.2],
         transformer=dict(
             type='Detr3DTransformer',
             decoder=dict(
@@ -119,7 +117,7 @@ model = dict(
                             embed_dims=256,
                             num_groups=8,
                             num_levels=4,
-                            num_cams=7,
+                            num_cams=6,
                             dropout=0.1,
                             num_pts=13,
                             bias=2.),
@@ -136,7 +134,7 @@ model = dict(
             pc_range=point_cloud_range,
             max_num=300,
             voxel_size=voxel_size,
-            num_classes=26), 
+            num_classes=10), 
         loss_cls=dict(
             type='FocalLoss',
             use_sigmoid=True,
@@ -159,8 +157,8 @@ model = dict(
             pc_range=point_cloud_range),)))
 
 
-dataset_type = 'Argoverse2DatasetT'
-data_root = 'data/av2/'
+dataset_type = 'CustomNuScenesDataset'
+data_root = 'data/nuscenes/'
 
 file_client_args = dict(backend='disk')
 
@@ -173,24 +171,24 @@ ida_aug_conf = {
         "rand_flip": False,
     }
 train_pipeline = [
-    dict(type='AV2LoadMultiViewImageFromFiles', to_float32=True),
+    dict(type='NuScenesLoadMultiViewImageFromFiles', to_float32=True),
     dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True, with_bbox=True,
         with_label=True, with_bbox_depth=True),
     dict(type='ObjectRangeFilter', point_cloud_range=point_cloud_range),
     dict(type='ObjectNameFilter', classes=class_names),
-    dict(type='AV2ResizeCropFlipRotImageV2', data_aug_conf=ida_aug_conf),
+    dict(type='NuScenesResizeCropFlipRotImageV2', data_aug_conf=ida_aug_conf),
     dict(type='NormalizeMultiviewImage', **img_norm_cfg),
-    dict(type='AV2PadMultiViewImage', size='same2max'),
-    dict(type='AV2DownsampleQuantizeInstanceDepthmap', downsample=depthnet_config['stride'], depth_config=depthnet_config),
+    dict(type='NuScenesPadMultiViewImage', size='same2max'),
+    dict(type='NuScenesDownsampleQuantizeInstanceDepthmap', downsample=depthnet_config['stride'], depth_config=depthnet_config),
     dict(type='PETRFormatBundle3D', class_names=class_names, collect_keys=collect_keys + ['prev_exists']),
     dict(type='Collect3D', keys=['gt_bboxes_3d', 'gt_labels_3d', 'img', 'gt_bboxes', 'gt_labels', 'centers2d', 'depths', 'prev_exists'] + collect_keys,
              meta_keys=('filename', 'ori_shape', 'img_shape', 'pad_shape', 'scale_factor', 'flip', 'box_mode_3d', 'box_type_3d', 'img_norm_cfg', 'scene_token', 'gt_bboxes_3d','gt_labels_3d', 'ins_depthmap', 'ins_depthmap_mask'))
 ]
 test_pipeline = [
-    dict(type='AV2LoadMultiViewImageFromFiles', to_float32=True),
-    dict(type='AV2ResizeCropFlipRotImageV2', data_aug_conf=ida_aug_conf),
+    dict(type='NuScenesLoadMultiViewImageFromFiles', to_float32=True),
+    dict(type='NuScenesResizeCropFlipRotImageV2', data_aug_conf=ida_aug_conf),
     dict(type='NormalizeMultiviewImage', **img_norm_cfg),
-    dict(type='AV2PadMultiViewImage', size='same2max'),
+    dict(type='NuScenesPadMultiViewImage', size='same2max'),
     dict(
         type='MultiScaleFlipAug3D',
         img_scale=(1333, 800),
@@ -213,8 +211,7 @@ data = dict(
     train=dict(
         type=dataset_type,
         data_root=data_root,
-        ann_file=data_root + 'av2_train_infos.pkl',
-        split='train',
+        ann_file= data_root + 'nuscenes2d_temporal_infos_train.pkl',
         load_interval=1,
         num_frame_losses=num_frame_losses,
         seq_split_num=2,
@@ -225,8 +222,7 @@ data = dict(
         collect_keys=collect_keys + ['img', 'prev_exists', 'img_metas'],
         queue_length=queue_length,
         test_mode=False,
-        use_valid_flag=False,
-        interval_test=True,
+        use_valid_flag=True,
         box_type_3d='LiDAR'),
     val=dict(
         type=dataset_type, 
@@ -234,24 +230,22 @@ data = dict(
         data_root=data_root,
         collect_keys=collect_keys + ['img', 'img_metas'], 
         queue_length=queue_length, 
-        ann_file=data_root +  'av2_val_infos.pkl', 
-        split='val',
+        ann_file=data_root + 'nuscenes2d_temporal_infos_val.pkl',
         load_interval=1,
         classes=class_names, 
         modality=input_modality,
-        interval_test=True,),
+        use_valid_flag=True,),
     test=dict(
         type=dataset_type, 
         pipeline=test_pipeline, 
         data_root=data_root,
         collect_keys=collect_keys + ['img', 'img_metas'], 
         queue_length=queue_length, 
-        ann_file=data_root +  'av2_val_infos.pkl', 
-        split='val',
+        ann_file=data_root + 'nuscenes2d_temporal_infos_val.pkl',
         load_interval=1,
         classes=class_names, 
         modality=input_modality,
-        interval_test=True,),
+        use_valid_flag=True,),
 
         shuffler_sampler=dict(type='InfiniteGroupEachSampleInBatchSampler'),
         nonshuffler_sampler=dict(type='DistributedSampler'),

@@ -314,7 +314,8 @@ class FarHead(AnchorFreeHead):
 
     def prepare_for_dn(self, batch_size, reference_points, img_metas):
         if self.training and self.with_dn:
-            targets = [torch.cat((img_meta['gt_bboxes_3d']._data.gravity_center, img_meta['gt_bboxes_3d']._data.tensor[:, 3:]),dim=1) for img_meta in img_metas ]
+            targets = [self._get_regression_targets_from_boxes(img_meta['gt_bboxes_3d']._data)
+                       for img_meta in img_metas]
             labels = [img_meta['gt_labels_3d']._data for img_meta in img_metas ]
             known = [(torch.ones_like(t)).cuda() for t in labels]
             know_idx = known
@@ -427,6 +428,12 @@ class FarHead(AnchorFreeHead):
             mask_dict = None
 
         return padded_reference_points, attn_mask, mask_dict
+
+    def _get_regression_targets_from_boxes(self, gt_bboxes):
+        targets = torch.cat((gt_bboxes.gravity_center, gt_bboxes.tensor[:, 3:]), dim=1)
+        if self.code_size <= 8 and targets.size(-1) > 7:
+            targets = targets[..., :7]
+        return targets
 
 
     def init_weights(self):
@@ -1043,7 +1050,7 @@ class FarHead(AnchorFreeHead):
         bbox_weights = bbox_weights * self.code_weights
 
         loss_bbox = self.loss_bbox(
-                bbox_preds[isnotnan, :10], normalized_bbox_targets[isnotnan, :10], bbox_weights[isnotnan, :10], avg_factor=num_total_pos)
+                bbox_preds[isnotnan, :self.code_size], normalized_bbox_targets[isnotnan, :self.code_size], bbox_weights[isnotnan, :self.code_size], avg_factor=num_total_pos)
 
         loss_cls = torch.nan_to_num(loss_cls)
         loss_bbox = torch.nan_to_num(loss_bbox)
@@ -1103,7 +1110,7 @@ class FarHead(AnchorFreeHead):
 
         
         loss_bbox = self.loss_bbox(
-                bbox_preds[isnotnan, :10], normalized_bbox_targets[isnotnan, :10], bbox_weights[isnotnan, :10], avg_factor=num_total_pos)
+                bbox_preds[isnotnan, :self.code_size], normalized_bbox_targets[isnotnan, :self.code_size], bbox_weights[isnotnan, :self.code_size], avg_factor=num_total_pos)
 
         loss_cls = torch.nan_to_num(loss_cls)
         loss_bbox = torch.nan_to_num(loss_bbox)
@@ -1150,10 +1157,13 @@ class FarHead(AnchorFreeHead):
         all_bbox_preds = preds_dicts['all_bbox_preds']
 
         num_dec_layers = len(all_cls_scores)
+        if isinstance(gt_labels_list[0], list):
+            gt_labels_list = [tmp[0] for tmp in gt_labels_list]
+        if isinstance(gt_bboxes_list[0], list):
+            gt_bboxes_list = [tmp[0] for tmp in gt_bboxes_list]
         device = gt_labels_list[0].device
-        gt_bboxes_list = [torch.cat(
-            (gt_bboxes.gravity_center, gt_bboxes.tensor[:, 3:]),
-            dim=1).to(device) for gt_bboxes in gt_bboxes_list]
+        gt_bboxes_list = [self._get_regression_targets_from_boxes(gt_bboxes).to(device)
+                          for gt_bboxes in gt_bboxes_list]
 
         all_gt_bboxes_list = [gt_bboxes_list for _ in range(num_dec_layers)]
         all_gt_labels_list = [gt_labels_list for _ in range(num_dec_layers)]

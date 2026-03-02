@@ -44,6 +44,16 @@ class AV2LoadMultiViewImageFromFiles(object):
         repr_str += f"color_type='{self.color_type}')"
         return repr_str
 
+
+@PIPELINES.register_module()
+class NuScenesLoadMultiViewImageFromFiles(AV2LoadMultiViewImageFromFiles):
+    pass
+
+
+@PIPELINES.register_module()
+class Far3DLoadMultiViewImageFromFiles(AV2LoadMultiViewImageFromFiles):
+    pass
+
 @PIPELINES.register_module()
 class AV2ResizeCropFlipRotImageV2():
     def __init__(self, data_aug_conf=None, multi_stamps=False):
@@ -337,6 +347,16 @@ class AV2ResizeCropFlipRotImageV2():
         crop = (crop_w, crop_h, crop_w + fW, crop_h + fH)
         return resize, resize_dims, crop
 
+
+@PIPELINES.register_module()
+class NuScenesResizeCropFlipRotImageV2(AV2ResizeCropFlipRotImageV2):
+    pass
+
+
+@PIPELINES.register_module()
+class Far3DResizeCropFlipRotImageV2(AV2ResizeCropFlipRotImageV2):
+    pass
+
 @PIPELINES.register_module()
 class AV2PadMultiViewImage():
     """Pad the multi-view image.
@@ -393,6 +413,16 @@ class AV2PadMultiViewImage():
         repr_str += f'size_divisor={self.size_divisor}, '
         repr_str += f'pad_val={self.pad_val})'
         return repr_str
+
+
+@PIPELINES.register_module()
+class NuScenesPadMultiViewImage(AV2PadMultiViewImage):
+    pass
+
+
+@PIPELINES.register_module()
+class Far3DPadMultiViewImage(AV2PadMultiViewImage):
+    pass
 
 @PIPELINES.register_module()
 class AV2DownsampleQuantizeDepthmap():
@@ -535,3 +565,13 @@ class AV2DownsampleQuantizeInstanceDepthmap():
             indices = indices.type(torch.int64)
 
         return indices
+
+
+@PIPELINES.register_module()
+class NuScenesDownsampleQuantizeInstanceDepthmap(AV2DownsampleQuantizeInstanceDepthmap):
+    pass
+
+
+@PIPELINES.register_module()
+class Far3DDownsampleQuantizeInstanceDepthmap(AV2DownsampleQuantizeInstanceDepthmap):
+    pass

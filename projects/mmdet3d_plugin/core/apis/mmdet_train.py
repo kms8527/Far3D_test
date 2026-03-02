@@ -36,7 +36,7 @@ def custom_train_detector(model,
                    timestamp=None,
                    eval_model=None,
                    meta=None):
-    logger = get_root_logger(cfg.log_level)
+    logger = get_root_logger(cfg.get('log_level', 'INFO'))
 
     # prepare data loaders
    
@@ -202,4 +202,3 @@ def custom_train_detector(model,
     elif cfg.load_from:
         runner.load_checkpoint(cfg.load_from)
     runner.run(data_loaders, cfg.workflow)
-
