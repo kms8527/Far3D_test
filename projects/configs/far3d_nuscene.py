@@ -212,6 +212,7 @@ data = dict(
         type=dataset_type,
         data_root=data_root,
         ann_file= data_root + 'nuscenes2d_temporal_infos_train.pkl',
+        with_velocity=False,
         load_interval=1,
         num_frame_losses=num_frame_losses,
         seq_split_num=2,
@@ -228,6 +229,7 @@ data = dict(
         type=dataset_type, 
         pipeline=test_pipeline, 
         data_root=data_root,
+        with_velocity=False,
         collect_keys=collect_keys + ['img', 'img_metas'], 
         queue_length=queue_length, 
         ann_file=data_root + 'nuscenes2d_temporal_infos_val.pkl',
@@ -239,6 +241,7 @@ data = dict(
         type=dataset_type, 
         pipeline=test_pipeline, 
         data_root=data_root,
+        with_velocity=False,
         collect_keys=collect_keys + ['img', 'img_metas'], 
         queue_length=queue_length, 
         ann_file=data_root + 'nuscenes2d_temporal_infos_val.pkl',
@@ -272,7 +275,10 @@ lr_config = dict(
 evaluation = dict(interval=num_iters_per_epoch*num_epochs, pipeline=test_pipeline)
 find_unused_parameters=False #### when use checkpoint, find_unused_parameters must be False
 checkpoint_config = dict(interval=num_iters_per_epoch, max_keep_ckpts=1)
-custom_hooks = [dict(type="UseGtDepthHook", stop_gt_depth_iter=22000)]
+custom_hooks = [
+    dict(type="UseGtDepthHook", stop_gt_depth_iter=22000),
+    dict(type='PeriodicCkptHook', interval=1000, save_dir='ckpts')
+]
 runner = dict(
     type='IterBasedRunner', max_iters=num_epochs * num_iters_per_epoch)
 load_from='ckpts/fcos3d_vovnet_imgbackbone-remapped.pth'

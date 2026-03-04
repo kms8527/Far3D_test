@@ -1,7 +1,7 @@
 # from .petr_transformer import PETRMultiheadAttention, PETRTransformerEncoder, PETRTemporalTransformer, \
 #     PETRTemporalDecoderLayer, PETRMultiheadFlashAttention, PETRTransformer,  PETRTransformerDecoder
 from .petr_transformer import *
-from .hook import UseGtDepthHook
+from .hook import PeriodicCkptHook, UseGtDepthHook
 from .layer_decay_optimizer_constructor import LearningRateDecayOptimizerConstructor
 from .detr3d_transformer import *
 from .warmup_fp16_optimizer import *
@@ -13,5 +13,6 @@ __all__ = [
     'PETRTemporalDecoderLayer',
     'PETRMultiheadFlashAttention',
     'UseGtDepthHook',
+    'PeriodicCkptHook',
     'LearningRateDecayOptimizerConstructor'
 ]

@@ -1,6 +1,9 @@
 checkpoint_config = dict(interval=3516, max_keep_ckpts=1)
 log_config = dict(interval=50, hooks=[dict(type='TextLoggerHook')])
-custom_hooks = [dict(type='UseGtDepthHook', stop_gt_depth_iter=22000)]
+custom_hooks = [
+    dict(type='UseGtDepthHook', stop_gt_depth_iter=22000),
+    dict(type='PeriodicCkptHook', interval=1000, save_dir='ckpts')
+]
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
 work_dir = '/home/a/opensource/Far3D_test/'
@@ -307,6 +310,7 @@ data = dict(
         type='CustomNuScenesDataset',
         data_root='data/nuscenes/',
         ann_file='data/nuscenes/nuscenes2d_temporal_infos_train.pkl',
+        with_velocity=False,
         load_interval=1,
         num_frame_losses=1,
         seq_split_num=2,
@@ -451,6 +455,7 @@ data = dict(
                 ])
         ],
         data_root='data/nuscenes/',
+        with_velocity=False,
         collect_keys=[
             'lidar2img', 'intrinsics', 'extrinsics', 'timestamp',
             'img_timestamp', 'ego_pose', 'ego_pose_inv', 'img', 'img_metas'
@@ -521,6 +526,7 @@ data = dict(
                 ])
         ],
         data_root='data/nuscenes/',
+        with_velocity=False,
         collect_keys=[
             'lidar2img', 'intrinsics', 'extrinsics', 'timestamp',
             'img_timestamp', 'ego_pose', 'ego_pose_inv', 'img', 'img_metas'
