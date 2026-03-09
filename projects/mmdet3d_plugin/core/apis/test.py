@@ -5,10 +5,13 @@
 # ---------------------------------------------
 import os.path as osp
 import pickle
+import re
 import shutil
 import tempfile
 import time
+import warnings
 
+import cv2
 import mmcv
 import torch
 import torch.distributed as dist
@@ -21,6 +24,275 @@ from mmdet.core import encode_mask_results
 import mmcv
 import numpy as np
 import pycocotools.mask as mask_util
+
+
+def _to_visual_results(result):
+    if isinstance(result, dict):
+        if 'bbox_results' in result:
+            return result['bbox_results']
+        if 'pts_bbox' in result:
+            return [result]
+        return None
+    return result
+
+
+def _unwrap_batch_item(item):
+    value = item
+    while True:
+        if hasattr(value, 'data') and not isinstance(value, torch.Tensor):
+            value = value.data
+            continue
+        if isinstance(value, (list, tuple)) and len(value) == 1:
+            value = value[0]
+            continue
+        break
+    return value
+
+
+def _to_numpy_image(img_tensor):
+    img = img_tensor.detach().cpu().permute(1, 2, 0).numpy()
+    if img.dtype != np.uint8:
+        img = np.clip(img, 0, 255).astype(np.uint8)
+    return np.ascontiguousarray(img)
+
+
+def _camera_name_from_filename(filename, view_idx):
+    if not isinstance(filename, str):
+        return f'camera_{view_idx}'
+
+    match = re.search(r'(CAM_(?:FRONT|FRONT_LEFT|FRONT_RIGHT|BACK|BACK_LEFT|BACK_RIGHT))', filename)
+    if match is not None:
+        return match.group(1)
+
+    match = re.search(r'(ring_(?:rear_left|side_left|front_left|front_center|front_right|side_right|rear_right))', filename)
+    if match is not None:
+        return match.group(1)
+
+    parent = osp.basename(osp.dirname(filename))
+    if parent:
+        return parent
+    return f'camera_{view_idx}'
+
+
+def _class_color(class_id):
+    palette = [
+        (255, 99, 71),
+        (60, 179, 113),
+        (30, 144, 255),
+        (255, 215, 0),
+        (186, 85, 211),
+        (255, 140, 0),
+        (46, 139, 87),
+        (70, 130, 180),
+        (220, 20, 60),
+        (154, 205, 50),
+        (0, 191, 255),
+        (199, 21, 133),
+    ]
+    return palette[int(class_id) % len(palette)]
+
+
+def _class_name(class_names, class_id):
+    if class_names is not None and 0 <= int(class_id) < len(class_names):
+        return str(class_names[int(class_id)])
+    return f'class_{int(class_id)}'
+
+
+def _save_projected_3d_boxes(data, vis_result, show_dir, rank, class_names=None):
+    if show_dir is None:
+        return False
+
+    img_raw = _unwrap_batch_item(data.get('img'))
+    img_metas_raw = _unwrap_batch_item(data.get('img_metas'))
+    if img_raw is None or img_metas_raw is None:
+        return False
+
+    if isinstance(img_metas_raw, dict):
+        img_metas = [img_metas_raw]
+    else:
+        img_metas = list(img_metas_raw)
+
+    if not isinstance(img_raw, torch.Tensor):
+        return False
+    if img_raw.dim() == 5:
+        batch_imgs = [img_raw[idx] for idx in range(img_raw.shape[0])]
+    elif img_raw.dim() == 4:
+        batch_imgs = [img_raw]
+    else:
+        return False
+
+    rank_dir = osp.join(show_dir, f'rank_{rank}')
+    mmcv.mkdir_or_exist(rank_dir)
+    edges = [(0, 1), (0, 3), (0, 4), (1, 2), (1, 5), (3, 2), (3, 7), (4, 5), (4, 7), (2, 6), (5, 6), (6, 7)]
+
+    lidar2img_raw = _unwrap_batch_item(data.get('lidar2img'))
+
+    sample_count = min(len(vis_result), len(batch_imgs), len(img_metas))
+    for sample_idx in range(sample_count):
+        sample_meta = img_metas[sample_idx]
+        sample_result = vis_result[sample_idx]
+        if not isinstance(sample_result, dict) or 'pts_bbox' not in sample_result:
+            continue
+
+        pts_bbox = sample_result['pts_bbox']
+        if 'boxes_3d' not in pts_bbox or 'scores_3d' not in pts_bbox:
+            continue
+
+        scores = pts_bbox['scores_3d'].detach().cpu().numpy()
+        labels = pts_bbox['labels_3d'].detach().cpu().numpy() if 'labels_3d' in pts_bbox else np.zeros_like(scores, dtype=np.int64)
+        score_mask = scores > 0.2
+        if not np.any(score_mask):
+            continue
+
+        corners = pts_bbox['boxes_3d'].corners.detach().cpu().numpy()[score_mask]
+        scores = scores[score_mask]
+        labels = labels[score_mask]
+
+        img_tensor = batch_imgs[sample_idx]
+        if img_tensor.dim() != 4:
+            continue
+
+        if isinstance(sample_meta.get('img_norm_cfg'), dict):
+            view_images = tensor2imgs(img_tensor, **sample_meta['img_norm_cfg'])
+        else:
+            view_images = [_to_numpy_image(view) for view in img_tensor]
+
+        lidar2img = sample_meta.get('lidar2img')
+        if lidar2img is None and lidar2img_raw is not None:
+            if isinstance(lidar2img_raw, torch.Tensor):
+                if lidar2img_raw.dim() == 4:
+                    lidar2img = lidar2img_raw[sample_idx].detach().cpu().numpy()
+                elif lidar2img_raw.dim() == 3:
+                    lidar2img = lidar2img_raw.detach().cpu().numpy()
+            elif isinstance(lidar2img_raw, (list, tuple)) and sample_idx < len(lidar2img_raw):
+                current = lidar2img_raw[sample_idx]
+                if isinstance(current, torch.Tensor):
+                    lidar2img = current.detach().cpu().numpy()
+                else:
+                    lidar2img = np.asarray(current)
+
+        lidar2img = np.asarray(lidar2img) if lidar2img is not None else None
+        if lidar2img.ndim != 3:
+            continue
+
+        sample_name = str(sample_meta.get('sample_idx') or sample_meta.get('scene_token') or sample_meta.get('lidar_timestamp') or sample_idx)
+        filenames = sample_meta.get('filename')
+        for view_idx, view_img in enumerate(view_images):
+            if view_idx >= lidar2img.shape[0]:
+                break
+            proj = lidar2img[view_idx]
+            pts = corners.reshape(-1, 3)
+            pts_h = np.concatenate([pts, np.ones((pts.shape[0], 1), dtype=pts.dtype)], axis=1)
+            proj_pts = pts_h @ proj.T
+            proj_pts[:, :2] /= np.clip(proj_pts[:, 2:3], 1e-5, None)
+            boxes_2d = proj_pts.reshape(-1, 8, 4)
+
+            canvas = np.ascontiguousarray(view_img.copy())
+            visible_classes = {}
+            for box_idx, box in enumerate(boxes_2d):
+                class_id = int(labels[box_idx])
+                cls_name = _class_name(class_names, class_id)
+                color = _class_color(class_id)
+                visible_classes[class_id] = (cls_name, color)
+                visible = []
+                for start, end in edges:
+                    if box[start][2] > 0 and box[end][2] > 0:
+                        visible.append(start)
+                        visible.append(end)
+                        cv2.line(
+                            canvas,
+                            (int(box[start][0]), int(box[start][1])),
+                            (int(box[end][0]), int(box[end][1])),
+                            color,
+                            2,
+                        )
+
+                if visible:
+                    vis_points = box[visible, :2]
+                    text_x = int(np.min(vis_points[:, 0]))
+                    text_y = max(15, int(np.min(vis_points[:, 1])) - 4)
+                    label_text = f'{cls_name}:{scores[box_idx]:.2f}'
+                    cv2.putText(
+                        canvas,
+                        label_text,
+                        (text_x, text_y),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.45,
+                        color,
+                        1,
+                        cv2.LINE_AA,
+                    )
+
+            legend_y = 20
+            for class_id in sorted(visible_classes):
+                cls_name, color = visible_classes[class_id]
+                cv2.rectangle(canvas, (8, legend_y - 10), (24, legend_y + 4), color, -1)
+                cv2.putText(
+                    canvas,
+                    f'{class_id}: {cls_name}',
+                    (30, legend_y),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45,
+                    color,
+                    1,
+                    cv2.LINE_AA,
+                )
+                legend_y += 18
+
+            camera_name = f'camera_{view_idx}'
+            if isinstance(filenames, (list, tuple)) and view_idx < len(filenames):
+                stem = osp.splitext(osp.basename(filenames[view_idx]))[0]
+                camera_name = _camera_name_from_filename(filenames[view_idx], view_idx)
+                out_name = f'{sample_name}_{stem}_3dbox.jpg'
+            else:
+                out_name = f'{sample_name}_view{view_idx}_3dbox.jpg'
+            camera_dir = osp.join(rank_dir, camera_name)
+            mmcv.mkdir_or_exist(camera_dir)
+            mmcv.imwrite(canvas, osp.join(camera_dir, out_name))
+
+    return True
+
+
+def _run_show_results(model, data, result, show, show_dir, rank, class_names=None):
+    if not (show or show_dir):
+        return
+
+    vis_result = _to_visual_results(result)
+    if vis_result is None:
+        warnings.warn('Unable to map prediction result to visualization format.')
+        return
+
+    module = model.module if hasattr(model, 'module') else model
+    show_fn = getattr(module, 'show_results', None)
+    if show_fn is None:
+        warnings.warn('`--show`/`--show-dir` requested but model has no show_results method.')
+        return
+
+    last_error = None
+    call_patterns = [
+        lambda: show_fn(data, vis_result, show=show, out_dir=show_dir),
+        lambda: show_fn(data, vis_result, out_dir=show_dir),
+        lambda: show_fn(data, vis_result, show=show),
+        lambda: show_fn(data, vis_result),
+    ]
+    for call in call_patterns:
+        try:
+            call()
+            return
+        except TypeError as err:
+            last_error = err
+        except KeyError as err:
+            if str(err).strip("'") == 'points':
+                if _save_projected_3d_boxes(data, vis_result, show_dir, rank, class_names=class_names):
+                    return
+            raise
+
+    if _save_projected_3d_boxes(data, vis_result, show_dir, rank, class_names=class_names):
+        return
+
+    warnings.warn(
+        '`--show`/`--show-dir` was requested, but all show_results call signatures failed. '
+        f'Last error: {last_error}')
 
 def custom_encode_mask_results(mask_results):
     """Encode bitmap mask to RLE code. Semantic Masks only
@@ -42,7 +314,12 @@ def custom_encode_mask_results(mask_results):
                         dtype='uint8'))[0])  # encoded with RLE
     return [encoded_mask_results]
 
-def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
+def custom_multi_gpu_test(model,
+                          data_loader,
+                          tmpdir=None,
+                          gpu_collect=False,
+                          show=False,
+                          show_dir=None):
     """Test model with multiple gpus.
     This method tests model with multiple gpus and collects the results
     under two different modes: gpu and cpu modes. By setting 'gpu_collect=True'
@@ -59,9 +336,14 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
         list: The prediction results.
     """
     model.eval()
+    if show_dir is not None:
+        mmcv.mkdir_or_exist(show_dir)
     bbox_results = []
     mask_results = []
     dataset = data_loader.dataset
+    class_names = getattr(model.module if hasattr(model, 'module') else model, 'CLASSES', None)
+    if class_names is None:
+        class_names = getattr(dataset, 'CLASSES', None)
     rank, world_size = get_dist_info()
     if rank == 0:
         prog_bar = mmcv.ProgressBar(len(dataset))
@@ -70,12 +352,27 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
     for i, data in enumerate(data_loader):
         with torch.no_grad():
             result = model(return_loss=False, rescale=True, **data)
+            batch_size = 0
+
+            _run_show_results(
+                model,
+                data,
+                result,
+                show=show,
+                show_dir=show_dir,
+                rank=rank,
+                class_names=class_names,
+            )
+
             # encode mask results
             if isinstance(result, dict):
                 if 'bbox_results' in result.keys():
                     bbox_result = result['bbox_results']
                     batch_size = len(result['bbox_results'])
                     bbox_results.extend(bbox_result)
+                elif 'pts_bbox' in result.keys():
+                    batch_size = 1
+                    bbox_results.append(result)
                 if 'mask_results' in result.keys() and result['mask_results'] is not None:
                     mask_result = custom_encode_mask_results(result['mask_results'])
                     mask_results.extend(mask_result)

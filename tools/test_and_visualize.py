@@ -230,11 +230,12 @@ def main():
             device_ids=[torch.cuda.current_device()],
             broadcast_buffers=False)
         outputs = custom_multi_gpu_test(model, data_loader, args.tmpdir,
-                                        args.gpu_collect)
+                                        args.gpu_collect, args.show,
+                                        args.show_dir)
 
 
     # 此前均不变，到此处一一转向，可在另一处写 method
-    import ipdb; ipdb.set_trace()
+
     '''
     outputs format:
         list of dict, length = num_data, each item as a dict.

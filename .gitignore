@@ -9,3 +9,5 @@ __pycache__/
 .vscode/
 ckpts/
 data/
+visualization/**
+test/far3d_nuscene/**
