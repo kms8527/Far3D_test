@@ -17,7 +17,7 @@ class_names = [
     'barrier', 'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'
 ]
 
-num_gpus = 8
+num_gpus = 1
 batch_size = 1
 num_iters_per_epoch = 28130 // (num_gpus * batch_size)
 num_epochs = 24
@@ -277,7 +277,7 @@ find_unused_parameters=False #### when use checkpoint, find_unused_parameters mu
 checkpoint_config = dict(interval=num_iters_per_epoch, max_keep_ckpts=1)
 custom_hooks = [
     dict(type="UseGtDepthHook", stop_gt_depth_iter=22000),
-    dict(type='PeriodicCkptHook', interval=1000, save_dir='ckpts')
+    dict(type='PeriodicCkptHook', interval=22000, save_dir='ckpts')
 ]
 runner = dict(
     type='IterBasedRunner', max_iters=num_epochs * num_iters_per_epoch)

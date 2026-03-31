@@ -178,7 +178,7 @@ class FarHead(AnchorFreeHead):
         self.with_position = with_position
         self.offset = offset
         self.offset_p = offset_p
-        self.num_smp_per_gt=num_smp_per_gt
+        self.num_smp_per_gt=num_smp_per_gt # number of denoising (DN) samples per GT, positive samples will be num_smp_per_gt times of the GT number, and negative samples will also be num_smp_per_gt times of the GT number
         self.query_num_dn = query_num_dn
 
         self.add_query_from_2d = add_query_from_2d
@@ -282,16 +282,23 @@ class FarHead(AnchorFreeHead):
             self.ego_pose_memory = MLN(180)
 
     def temporal_alignment(self, query_pos, tgt, reference_points):
+        """
+        Args:
+            query_pos: [B, num_query(+num_propagated), embed_dims] : query position embedding
+            tgt: [B, num_query(+num_propagated), embed_dims] : query content embedding
+            reference_points: [B, num_query(+num_propagated), 3] : reference points
+        """
+        
         B = query_pos.size(0)
 
-        temp_reference_point = (self.memory_reference_point - self.pc_range[:3]) / (self.pc_range[3:6] - self.pc_range[0:3])
-        temp_pos = self.query_embedding(pos2posemb3d(temp_reference_point)) 
+        temp_reference_point = (self.memory_reference_point - self.pc_range[:3]) / (self.pc_range[3:6] - self.pc_range[0:3]) # 정규화 [-1~1] (B, memory_len, 3)
+        temp_pos = self.query_embedding(pos2posemb3d(temp_reference_point))
         temp_memory = self.memory_embedding
         rec_ego_pose = torch.eye(4, device=query_pos.device).unsqueeze(0).unsqueeze(0).repeat(B, query_pos.size(1), 1, 1)
         
         if self.with_ego_pos:
-            rec_ego_motion = torch.cat([torch.zeros_like(reference_points[...,:3]), rec_ego_pose[..., :3, :].flatten(-2)], dim=-1)
-            rec_ego_motion = nerf_positional_encoding(rec_ego_motion)
+            rec_ego_motion = torch.cat([torch.zeros_like(reference_points[...,:3]), rec_ego_pose[..., :3, :].flatten(-2)], dim=-1) # (0, 0, 9) for current frame, (B, num_query(+num_propagated), 15)
+            rec_ego_motion = nerf_positional_encoding(rec_ego_motion) # positional encoding for ego motion
             tgt = self.ego_pose_memory(tgt, rec_ego_motion)
             query_pos = self.ego_pose_pe(query_pos, rec_ego_motion)
             memory_ego_motion = torch.cat([self.memory_velo, self.memory_timestamp, self.memory_egopose[..., :3, :].flatten(-2)], dim=-1).float()
@@ -314,41 +321,48 @@ class FarHead(AnchorFreeHead):
 
     def prepare_for_dn(self, batch_size, reference_points, img_metas):
         if self.training and self.with_dn:
+            # Build DN (denoising) queries from GT boxes/labels.
+            # DN queries are prepended before normal matching queries and are
+            # supervised separately to stabilize early training.
             targets = [self._get_regression_targets_from_boxes(img_meta['gt_bboxes_3d']._data)
-                       for img_meta in img_metas]
-            labels = [img_meta['gt_labels_3d']._data for img_meta in img_metas ]
-            known = [(torch.ones_like(t)).cuda() for t in labels]
+                       for img_meta in img_metas] # list of (num_gt, gt_box) * batch_size // # gt_box : (x, y, z, dx, dy, dz, heading)
+            labels = [img_meta['gt_labels_3d']._data for img_meta in img_metas ] # list of (num_gt, ) * batch_size 의 gt_label, 0~num_classes-1
+            known = [(torch.ones_like(t)).cuda() for t in labels] # list of (num_gt, ) * batch_size, 1 for known, 0 for unknown
             know_idx = known
             unmask_bbox = unmask_label = torch.cat(known)
             #gt_num
-            known_num = [t.size(0) for t in targets]
+            known_num = [t.size(0) for t in targets] # batch x [1(각 배치별 객체 수)] 
         
-            labels = torch.cat([t for t in labels])
-            boxes = torch.cat([t for t in targets])
-            batch_idx = torch.cat([torch.full((t.size(0) * self.num_smp_per_gt, ), i) for i, t in enumerate(targets)])
+            labels = torch.cat([t for t in labels]) # 각 배치 별 객체 클래스 flatten [batch x (class)]
+            boxes = torch.cat([t for t in targets]) # 각 배치 별 gt box flatten [batch x (x, y, z, dx, dy, dz, heading)]
+            batch_idx = torch.cat([torch.full((t.size(0) * self.num_smp_per_gt, ), i) for i, t in enumerate(targets)]) # each gt box's bach index
             batch_idx_gt = torch.cat([torch.full((t.size(0), ), i) for i, t in enumerate(targets)])
         
-            known_indice = torch.nonzero(unmask_label.repeat(self.num_smp_per_gt))
+            known_indice = torch.nonzero(unmask_label.repeat(self.num_smp_per_gt)) # known_indice : gt box의 개수 x num_smp_per_gt (각 gt box마다 num_smp_per_gt개의 noisy sample이 만들어짐) // known_indice : (num_gt x num_smp_per_gt, 1)
             known_indice = known_indice.view(-1)
             # add noise
-            num_pos = max(known_num)
+            num_pos = max(known_num) # 
+            # groups controls how many DN replicas are created, bounded by
+            # scalar and DN query budget.
             groups = min(self.scalar, self.query_num_dn // max(num_pos, 1))
             known_indice = known_indice.repeat(groups, 1).view(-1)
             known_labels = labels[None].repeat(groups, 1).long().to(reference_points.device)
             known_bid = batch_idx.repeat(groups, 1).view(-1)
             known_bboxs = boxes[None].repeat(groups, 1, 1).to(reference_points.device)
-            known_bbox_center = known_bboxs[..., :3].clone()
+            known_bbox_center = known_bboxs[..., :3].clone() # [groups, batch x num_gt, 3]
             known_bbox_scale = known_bboxs[..., 3:6].clone()
             batch_idx_gt = batch_idx_gt[None].repeat(groups, 1).float()
             batch_idx_pred = batch_idx[None].repeat(groups, 1).float()
 
             if self.bbox_noise_scale > 0:
+                # Positive DN samples: local perturbation around GT center.
                 diff_p = known_bbox_scale / 2 + self.bbox_noise_trans
-                diff_p = torch.mul(torch.rand_like(known_bbox_center) + self.offset_p, diff_p) * self.bbox_noise_scale
+                diff_p = torch.mul(torch.rand_like(known_bbox_center) + self.offset_p, diff_p) * self.bbox_noise_scale # bbox length change : bbox original length / 2 * noise_scale(0~1)
                 rand_sign = torch.randint_like(known_bbox_center, low=0, high=2, dtype=torch.float32) * 2.0 - 1.0
-                known_bbox_center_p = known_bbox_center + torch.mul(rand_sign, diff_p)
+                known_bbox_center_p = known_bbox_center + torch.mul(rand_sign, diff_p) # perturbed bbox center : it is designed to be within the original bbox
 
-                neg_smp_per_gt = self.num_smp_per_gt - 1
+                # Negative DN samples: larger random perturbation.
+                neg_smp_per_gt = self.num_smp_per_gt - 1 # 
                 known_bbox_center_ori = torch.zeros_like(known_bbox_center.repeat(1, neg_smp_per_gt, 1))
                 left = 0
                 for i in range(len(known_num)):
@@ -380,12 +394,18 @@ class FarHead(AnchorFreeHead):
                 known_bbox_center_[..., 0:3] = (known_bbox_center_[..., 0:3] - self.pc_range[0:3]) / (self.pc_range[3:6] - self.pc_range[0:3])
                 known_bbox_center_ = known_bbox_center_.clamp(min=0.0, max=1.0)
             
+            # DN region size in query dimension.
+            # single_pad: max GT count per batch * samples per GT.
+            # pad_size: single_pad * groups.
             single_pad = int(max(known_num)) * self.num_smp_per_gt
             pad_size = int(single_pad * groups )
             padding_bbox = torch.zeros(pad_size, 3).to(reference_points.device)
+            # Prepend DN slots before normal learnable reference points.
             padded_reference_points = torch.cat([padding_bbox, reference_points], dim=0).unsqueeze(0).repeat(batch_size, 1, 1)
 
             if len(known_num):
+                # map_known_indice maps each noisy GT sample to its location in
+                # the prepended DN area (including group offsets).
                 map_known_indice = torch.cat([torch.tensor(range(num * self.num_smp_per_gt)) for num in known_num])  # [1,2, 1,2,3]
                 map_known_indice = torch.cat([map_known_indice + single_pad * i for i in range(groups)]).long()
             if len(known_bid):
@@ -396,6 +416,7 @@ class FarHead(AnchorFreeHead):
             # match query cannot see the reconstruct
             attn_mask[pad_size:, :pad_size] = True
             # reconstruct cannot see each other
+            # Isolate DN groups from each other to avoid cross-group leakage.
             for i in range(groups):
                 if i == 0:
                     attn_mask[single_pad * i:single_pad * (i + 1), single_pad * (i + 1):pad_size] = True
@@ -412,6 +433,7 @@ class FarHead(AnchorFreeHead):
             temporal_attn_mask[pad_size:, :pad_size] = True
             attn_mask = temporal_attn_mask
 
+            # Saved for DN loss reconstruction in prepare_for_loss().
             mask_dict = {
                 'known_indice': torch.as_tensor(known_indice).long(),
                 'batch_idx': torch.as_tensor(batch_idx).long(),
@@ -430,6 +452,9 @@ class FarHead(AnchorFreeHead):
         return padded_reference_points, attn_mask, mask_dict
 
     def _get_regression_targets_from_boxes(self, gt_bboxes):
+        """
+        gt_bboxes: (N, 10) [x, y, z, dx, dy, dz, heading, vx, vy, var] or (N, 7) [x, y, z, dx, dy, dz, heading]
+        """
         targets = torch.cat((gt_bboxes.gravity_center, gt_bboxes.tensor[:, 3:]), dim=1)
         if self.code_size <= 8 and targets.size(-1) > 7:
             targets = targets[..., :7]
@@ -469,8 +494,8 @@ class FarHead(AnchorFreeHead):
             self.memory_velo = x.new_zeros(B, self.memory_len, 2)
         else:
             self.memory_timestamp += data['timestamp'].unsqueeze(-1).unsqueeze(-1)
-            self.memory_egopose = data['ego_pose_inv'].unsqueeze(1) @ self.memory_egopose
-            self.memory_reference_point = transform_reference_points(self.memory_reference_point, data['ego_pose_inv'], reverse=False)
+            self.memory_egopose = data['ego_pose_inv'].unsqueeze(1) @ self.memory_egopose # [ B, memory_len, 4, 4], transform to current ego coordinate
+            self.memory_reference_point = transform_reference_points(self.memory_reference_point, data['ego_pose_inv'], reverse=False) # transform to current ego coordinate
             self.memory_timestamp = memory_refresh(self.memory_timestamp[:, :self.memory_len], x)
             self.memory_reference_point = memory_refresh(self.memory_reference_point[:, :self.memory_len], x)
             self.memory_embedding = memory_refresh(self.memory_embedding[:, :self.memory_len], x)
@@ -479,9 +504,9 @@ class FarHead(AnchorFreeHead):
         
         # for the first frame, padding pseudo_reference_points (non-learnable)
         if self.num_propagated > 0:
-            pseudo_reference_points = self.pseudo_reference_points.weight * (self.pc_range[3:6] - self.pc_range[0:3]) + self.pc_range[0:3]
-            self.memory_reference_point[:, :self.num_propagated]  = self.memory_reference_point[:, :self.num_propagated] + (1 - x).view(B, 1, 1) * pseudo_reference_points
-            self.memory_egopose[:, :self.num_propagated]  = self.memory_egopose[:, :self.num_propagated] + (1 - x).view(B, 1, 1, 1) * torch.eye(4, device=x.device)
+            pseudo_reference_points = self.pseudo_reference_points.weight * (self.pc_range[3:6] - self.pc_range[0:3]) + self.pc_range[0:3] # 실제 ego 좌표계로 denormalize
+            self.memory_reference_point[:, :self.num_propagated]  = self.memory_reference_point[:, :self.num_propagated] + (1 - x).view(B, 1, 1) * pseudo_reference_points # for the first frame, add the pseudo reference points to memory
+            self.memory_egopose[:, :self.num_propagated]  = self.memory_egopose[:, :self.num_propagated] + (1 - x).view(B, 1, 1, 1) * torch.eye(4, device=x.device) # for the first frame, add the pseudo ego pose to memory
 
     def post_update_memory(self, data, rec_ego_pose, all_cls_scores, all_bbox_preds, outs_dec, mask_dict):
         if self.training and mask_dict and mask_dict['pad_size'] > 0:
@@ -499,20 +524,20 @@ class FarHead(AnchorFreeHead):
         
         # topk proposals
         _, topk_indexes = torch.topk(rec_score, self.topk_proposals, dim=1)
-        rec_timestamp = topk_gather(rec_timestamp, topk_indexes)
-        rec_reference_points = topk_gather(rec_reference_points, topk_indexes).detach()
-        rec_memory = topk_gather(rec_memory, topk_indexes).detach()
-        rec_ego_pose = topk_gather(rec_ego_pose, topk_indexes)
-        rec_velo = topk_gather(rec_velo, topk_indexes).detach()
+        rec_timestamp = topk_gather(rec_timestamp, topk_indexes) # [B, topk_proposals, 1]
+        rec_reference_points = topk_gather(rec_reference_points, topk_indexes).detach() # [B, topk_proposals, 3]
+        rec_memory = topk_gather(rec_memory, topk_indexes).detach() # [B, topk_proposals, embed_dims]
+        rec_ego_pose = topk_gather(rec_ego_pose, topk_indexes) # [B, topk_proposals, 4, 4]
+        rec_velo = topk_gather(rec_velo, topk_indexes).detach() # [B, topk_proposals, 2]
 
-        self.memory_embedding = torch.cat([rec_memory, self.memory_embedding], dim=1)
-        self.memory_timestamp = torch.cat([rec_timestamp, self.memory_timestamp], dim=1)
-        self.memory_egopose= torch.cat([rec_ego_pose, self.memory_egopose], dim=1)
-        self.memory_reference_point = torch.cat([rec_reference_points, self.memory_reference_point], dim=1)
-        self.memory_velo = torch.cat([rec_velo, self.memory_velo], dim=1)
-        self.memory_reference_point = transform_reference_points(self.memory_reference_point, data['ego_pose'], reverse=False)
-        self.memory_timestamp -= data['timestamp'].unsqueeze(-1).unsqueeze(-1)
-        self.memory_egopose = data['ego_pose'].unsqueeze(1) @ self.memory_egopose
+        self.memory_embedding = torch.cat([rec_memory, self.memory_embedding], dim=1) # [ B, topk_proposals+memory_len, embed_dims]
+        self.memory_timestamp = torch.cat([rec_timestamp, self.memory_timestamp], dim=1) # [B, topk_proposals+memory_len, 1]
+        self.memory_egopose= torch.cat([rec_ego_pose, self.memory_egopose], dim=1) # [B, topk_proposals+memory_len, 4, 4]
+        self.memory_reference_point = torch.cat([rec_reference_points, self.memory_reference_point], dim=1) # [B, topk_proposals+memory_len, 3]
+        self.memory_velo = torch.cat([rec_velo, self.memory_velo], dim=1) # [B, topk_proposals+memory_len, 2]
+        self.memory_reference_point = transform_reference_points(self.memory_reference_point, data['ego_pose'], reverse=False) # transform to global coordinate
+        self.memory_timestamp -= data['timestamp'].unsqueeze(-1).unsqueeze(-1) # update to current timestamp
+        self.memory_egopose = data['ego_pose'].unsqueeze(1) @ self.memory_egopose # [B, topk_proposals+memory_len, 4, 4], ego pose to global
     
     def _get_gt_depth(self, img_metas, device, BNHW):
         B, N, H, W = BNHW
@@ -553,9 +578,9 @@ class FarHead(AnchorFreeHead):
         """
         self.pre_update_memory(data)
         mlvl_feats = data['img_feats']
-        B, N, _, _, _ = mlvl_feats[0].shape
+        B, N, _, _, _ = mlvl_feats[0].shape # [B, N, C, H, W] 이게 list로 여러개 들어옴
 
-        reference_points = self.reference_points.weight
+        reference_points = self.reference_points.weight # [num_query, 3]
         dtype = reference_points.dtype
         intrinsics = data['intrinsics'] / 1e3
         extrinsics = data['extrinsics'][..., :3, :]
@@ -577,7 +602,7 @@ class FarHead(AnchorFreeHead):
         
         if self.add_query_from_2d:
             # pred depth processs
-            pred_depth = outs_roi['pred_depth'].detach()
+            pred_depth = outs_roi['pred_depth'].detach() # (BN, depth_bins, H, W), depth logits or depth bins depending on the setting
             pred_depth_ = torch.argmax(pred_depth.permute(0, 2, 3, 1), dim=-1, keepdim=True)  # (BN, H, W, 1)
             bbox2d_scores = outs_roi['bbox2d_scores'].detach() if self.return_bbox2d_scores else None # (M, 1)
             if self.return_context_feat:
@@ -585,7 +610,7 @@ class FarHead(AnchorFreeHead):
                 valid_indices = outs_roi['valid_indices']
                 context_feat = feat_flatten[valid_indices.repeat(1, 1, _dim)].reshape(-1, _dim)
 
-                context2d_feat = context_feat.detach()
+                context2d_feat = context_feat.detach() # freezing (backbone 단에서 나온 2D feature는 학습 x -> backbone freezing)
             else:
                 context2d_feat =  None # 2D context (M, C)
 
@@ -600,7 +625,7 @@ class FarHead(AnchorFreeHead):
                 # [Deprecated] add noise if needed...
 
             padHW = img_metas[0]['pad_shape'][0][:2]
-            if self.use_offline_2d:
+            if self.use_offline_2d: # offline 2D bbox 예측 결과를 2D proposal로 사용
                 pred_bbox_list = img_metas[0]['offline_2d']     # currently only for bs=1, BN*(M, 6), float64
                 pred_bbox_list, bbox2d_scores = self.split_offline_pred2d(pred_bbox_list, mlvl_feats[0].device)   # BN*(M, 4), (M', 1)
                 # img_metas[0]['offline_2d']
@@ -622,7 +647,7 @@ class FarHead(AnchorFreeHead):
                 self.pred_depth_var = True
             pro2d_num = 0
             if reference_points2d is not None:
-                pro2d_num = reference_points2d.shape[1]
+                pro2d_num = reference_points2d.shape[1] # number of 2D proposal queries (예측한 객체 수 = yolo가 예측한 bbox 수)
                 query_embeds2d = self.query_embedding(pos2posemb3d(reference_points2d))
                 query_pos = torch.cat([query_pos, query_embeds2d], dim=1)     # (B pad_size+num_Q+M C)
                 reference_points = torch.cat([reference_points, reference_points2d], dim=1)     # (B pad_size+num_Q+M 3)
@@ -642,7 +667,7 @@ class FarHead(AnchorFreeHead):
         tgt = torch.zeros_like(query_pos)
         if 'context_feat' in locals() and context_feat is not None:    # add context to Q_feat
             context_feat = self.context_embed(context_feat)  # newly add
-            tgt[:, -pro2d_num:, :] = context_feat
+            tgt[:, -pro2d_num:, :] = context_feat # [B, learnable queries + 2D proposal queries (+ propagated queries), embed_dims]
 
         # prepare for the tgt and query_pos using mln.
         tgt, query_pos, reference_points, temp_memory, temp_pos, rec_ego_pose = self.temporal_alignment(query_pos, tgt, reference_points)
@@ -739,7 +764,7 @@ class FarHead(AnchorFreeHead):
         h_max, w_max = pred_depth.shape[1:3]
         for ith, pred_bbox in enumerate(pred_bbox_list):
             if bbox_nums[ith] != 0:
-                cur_depthmap = pred_depth[ith].flatten(0, 1)     # shape (HW, 1) or (HW, D)
+                cur_depthmap = pred_depth[ith].flatten(0, 1)     # shape (HW, 1)
                 cur_center2d = (pred_bbox[:, :2] / depth_downsample).round().long()      # first w then h
                 cur_center2d[cur_center2d < 0] = 0
                 cur_center2d[:, 0][cur_center2d[:, 0] >= w_max] = w_max - 1
@@ -767,7 +792,7 @@ class FarHead(AnchorFreeHead):
                 topk_values, topk_indices = torch.topk(depths, topk, dim=1)  # (M, K)
                 valid_indices = topk_indices[:, 0] >= range_min_bin          # (M)
                 bboxes_extra = bboxes.repeat(topk-1, 1)
-                bboxes = torch.cat([bboxes, bboxes_extra[valid_indices.repeat(topk-1)]], dim=0) # (M', 4)
+                bboxes = torch.cat([bboxes, bboxes_extra[valid_indices.repeat(topk-1)]], dim=0) # (M', 4), 4 : (w, h, w, h)
                 depths_extra = topk_indices[:, 1:][valid_indices]   # (M, topk-1)
                 depths_extra = depths_extra.transpose(1, 0).flatten().unsqueeze(-1)     # (M*(topk-1), 1)
                 depths = torch.cat([topk_indices[:, 0:1], depths_extra], dim=0)

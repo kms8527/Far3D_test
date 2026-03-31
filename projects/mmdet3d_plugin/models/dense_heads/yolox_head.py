@@ -276,6 +276,10 @@ class YOLOXHeadCustom(BaseDenseHead, BBoxTestMixin):
                            self.multi_level_conv_obj,
                            self.multi_level_conv_centers2d,
                            )
+        # cls_scores : #Level of Feature map x(BN, num_cls, Hi, Wi) :  For each level, each location predicts class logits. 
+        # bbox_preds : #Level of Feature map x(BN, 4, Hi, Wi) : Box regression outputs per location. 
+        # objectnesses : #Level of Feature map x(BN, 1, Hi, Wi) : 물체 있냐/없냐 점수. 크면 물체일 확률 높음, 작으면 물체일 확률 낮음
+        # centers2d_offsets : #Level of Feature map x(BN, 2, Hi, Wi) : 2D center offset (dx, dy) relative to prior/grid point.
         out = {
             'enc_cls_scores': cls_scores,
             'enc_bbox_preds': bbox_preds,
@@ -395,9 +399,9 @@ class YOLOXHeadCustom(BaseDenseHead, BBoxTestMixin):
             threshold_score = self.threshold_score
         else:
             topk_proposal = self.topk_proposal
-        cls_scores = preds_dicts['enc_cls_scores']      # shape 3x(BN num_cls Hi Wi), they are logits
-        bbox_preds = preds_dicts['enc_bbox_preds']      # shape 3x(BN 4 Hi Wi)
-        objectnesses = preds_dicts['objectnesses']      # shape 3x(BN 1 Hi Wi)
+        cls_scores = preds_dicts['enc_cls_scores']      # shape #Level of Feature map x(BN num_cls Hi Wi), they are logits
+        bbox_preds = preds_dicts['enc_bbox_preds']      # shape #Level of Feature map x(BN 4 Hi Wi)
+        objectnesses = preds_dicts['objectnesses']      # shape #Level of Feature map x(BN 1 Hi Wi)
         num_imgs = cls_scores[0].shape[0]
         featmap_sizes = [cls_score.shape[2:] for cls_score in cls_scores]
         mlvl_priors = self.prior_generator.grid_priors(featmap_sizes, dtype=cls_scores[0].dtype, device=cls_scores[0].device, with_stride=True)       # 3x(Hi*Wi, 4)
@@ -426,10 +430,10 @@ class YOLOXHeadCustom(BaseDenseHead, BBoxTestMixin):
         for i in range(len(objectnesses)):
         # for cls_score in cls_scores:
             # sample_weight = cls_scores[i].topk(1, dim=1).values.sigmoid()       # (BN, 1, Hi, Wi)
-            sample_weight = objectnesses[i].sigmoid() * cls_scores[i].topk(1, dim=1).values.sigmoid()
-            sample_weight_nms = nn.functional.max_pool2d(sample_weight, (3, 3), stride=1, padding=1)
+            sample_weight = objectnesses[i].sigmoid() * cls_scores[i].topk(1, dim=1).values.sigmoid() # (BN, 1, Hi, Wi)
+            sample_weight_nms = nn.functional.max_pool2d(sample_weight, (3, 3), stride=1, padding=1) # (BN, 1, Hi, Wi)
             sample_weight_nms = sample_weight_nms.permute(0, 2, 3, 1).reshape(num_imgs, -1, 1)  # (BN, Hi*Wi, 1)
-            sample_weight_ = sample_weight.permute(0, 2, 3, 1).reshape(num_imgs, -1, 1)
+            sample_weight_ = sample_weight.permute(0, 2, 3, 1).reshape(num_imgs, -1, 1) # (BN, Hi*Wi, 1)
             sample_weight = sample_weight_ * (sample_weight_ == sample_weight_nms).float()  # (BN, Hi*Wi, 1)
             valid_indices_list.append(sample_weight)
         valid_indices = torch.cat(valid_indices_list, dim=1)

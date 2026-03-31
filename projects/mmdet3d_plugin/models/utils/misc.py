@@ -61,6 +61,7 @@ def locations(features, stride, pad_h, pad_w):
             features:  (N, C, H, W)
         Return:
             locations:  (H, W, 2)
+        Content: Generate location coordinates for each feature map position.
         """
 
         h, w = features.size()[-2:]

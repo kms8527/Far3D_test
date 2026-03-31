@@ -524,9 +524,9 @@ class DeformableFeatureAggregationCuda(BaseModule):
         reference_points = get_global_pos(reference_points, pc_range)
         key_points = reference_points.unsqueeze(-2) + self.learnable_fc(instance_feature).reshape(bs, num_anchor, -1, 3)
         # key_points_ = key_points.cpu().numpy()
-        weights = self._get_weights(instance_feature, query_pos, lidar2img_mat)
+        weights = self._get_weights(instance_feature, query_pos, lidar2img_mat) # [N, ]
 
-        features = self.feature_sampling(feat_flatten, spatial_flatten, level_start_index, key_points, weights, lidar2img_mat, img_metas)
+        features = self.feature_sampling(feat_flatten, spatial_flatten, level_start_index, key_points, weights, lidar2img_mat, img_metas) # [B, pad_size + num_query + num_propagated, C]
 
         output = self.output_proj(features)
         output = self.drop(output) + instance_feature
@@ -536,7 +536,7 @@ class DeformableFeatureAggregationCuda(BaseModule):
         bs, num_anchor = instance_feature.shape[:2]
         lidar2img = lidar2img_mat[..., :3, :].flatten(-2)
         cam_embed = self.cam_embed(lidar2img) # B, N, C
-        feat_pos = (instance_feature + anchor_embed).unsqueeze(2) + cam_embed.unsqueeze(1)
+        feat_pos = (instance_feature + anchor_embed).unsqueeze(2) + cam_embed.unsqueeze(1) # 3d query들에 대해 각 카메라 별로 weight를 구하기 위해 lidar2img embed를 더함
         weights = self.weights_fc(feat_pos).reshape(bs, num_anchor, -1, self.num_groups).softmax(dim=-2)
         weights = weights.reshape(bs, num_anchor, self.num_cams, -1, self.num_groups).permute(0, 2, 1, 4, 3).contiguous()
         return weights.flatten(end_dim=1)

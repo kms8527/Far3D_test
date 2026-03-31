@@ -19,8 +19,8 @@ class_names = ['ARTICULATED_BUS', 'BICYCLE', 'BICYCLIST', 'BOLLARD', 'BOX_TRUCK'
                'STOP_SIGN', 'STROLLER', 'TRUCK', 'TRUCK_CAB', 'VEHICULAR_TRAILER',
                'WHEELCHAIR', 'WHEELED_DEVICE','WHEELED_RIDER']
 
-num_gpus = 8
-batch_size = 1
+num_gpus = 1
+batch_size = 2
 num_iters_per_epoch = 110071 // (num_gpus * batch_size) 
 num_epochs = 6
 embed_dims=256

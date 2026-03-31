@@ -11,3 +11,4 @@ ckpts/
 data/
 visualization/**
 test/far3d_nuscene/**
+**.pyc
