@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn 
+import torch.nn.functional as F
 from mmcv.cnn import Linear, bias_init_with_prob, Scale
 
 from mmcv.runner import force_fp32
@@ -103,6 +104,15 @@ class FarHead(AnchorFreeHead):
                  with_position=True,
                  init_cfg=None,
                  normedlinear=False,
+                 use_vehicle_kinematics=False,
+                 vehicle_class_ids=None,
+                 vehicle_yaw_rate_threshold=1e-3,
+                 vehicle_speed_limit=40.0,
+                 vehicle_motion_heading_weight=2.0,
+                 vehicle_detected_heading_weight=1.0,
+                 vehicle_motion_heading_speed_threshold=0.5,
+                 debug_vehicle_kinematics=False,
+                 debug_vehicle_kinematics_max=64,
                  **kwargs):
         # NOTE here use `AnchorFreeHead` instead of `TransformerHead`,
         # since it brings inconvenience when the initialization of
@@ -192,6 +202,15 @@ class FarHead(AnchorFreeHead):
         self.return_context_feat = return_context_feat
         self.return_bbox2d_scores = return_bbox2d_scores
         self.use_offline_2d = use_offline_2d
+        self.use_vehicle_kinematics = use_vehicle_kinematics
+        self.vehicle_class_ids = tuple(vehicle_class_ids or [])
+        self.vehicle_yaw_rate_threshold = vehicle_yaw_rate_threshold
+        self.vehicle_speed_limit = vehicle_speed_limit
+        self.vehicle_motion_heading_weight = vehicle_motion_heading_weight
+        self.vehicle_detected_heading_weight = vehicle_detected_heading_weight
+        self.vehicle_motion_heading_speed_threshold = vehicle_motion_heading_speed_threshold
+        self.debug_vehicle_kinematics = debug_vehicle_kinematics
+        self.debug_vehicle_kinematics_max = debug_vehicle_kinematics_max
 
         self.act_cfg = transformer.get('act_cfg',
                                        dict(type='ReLU', inplace=True))
@@ -291,7 +310,9 @@ class FarHead(AnchorFreeHead):
         
         B = query_pos.size(0)
 
-        temp_reference_point = (self.memory_reference_point - self.pc_range[:3]) / (self.pc_range[3:6] - self.pc_range[0:3]) # 정규화 [-1~1] (B, memory_len, 3)
+        propagated_memory_reference = self._propagate_vehicle_memory(self.memory_reference_point)
+        self._update_vehicle_kinematics_debug(self.memory_reference_point, propagated_memory_reference)
+        temp_reference_point = (propagated_memory_reference - self.pc_range[:3]) / (self.pc_range[3:6] - self.pc_range[0:3]) # 정규화 [-1~1] (B, memory_len, 3)
         temp_pos = self.query_embedding(pos2posemb3d(temp_reference_point))
         temp_memory = self.memory_embedding
         rec_ego_pose = torch.eye(4, device=query_pos.device).unsqueeze(0).unsqueeze(0).repeat(B, query_pos.size(1), 1, 1)
@@ -313,7 +334,7 @@ class FarHead(AnchorFreeHead):
             tgt = torch.cat([tgt, temp_memory[:, :self.num_propagated]], dim=1)
             query_pos = torch.cat([query_pos, temp_pos[:, :self.num_propagated]], dim=1)
             reference_points = torch.cat([reference_points, temp_reference_point[:, :self.num_propagated]], dim=1)
-            rec_ego_pose = torch.eye(4, device=query_pos.device).unsqueeze(0).unsqueeze(0).repeat(B, query_pos.shape[1]+self.num_propagated, 1, 1)
+            rec_ego_pose = torch.eye(4, device=query_pos.device).unsqueeze(0).unsqueeze(0).repeat(B, query_pos.shape[1], 1, 1)
             temp_memory = temp_memory[:, self.num_propagated:]
             temp_pos = temp_pos[:, self.num_propagated:]
             
@@ -481,10 +502,216 @@ class FarHead(AnchorFreeHead):
         self.memory_timestamp = None
         self.memory_egopose = None
         self.memory_velo = None
+        self.memory_heading = None
+        self.memory_yaw_rate = None
+        self.memory_label = None
+        self.debug_last_vehicle_kinematics = None
+
+    def _wrap_angle(self, angle):
+        return torch.atan2(torch.sin(angle), torch.cos(angle))
+
+    def _rotate_planar_state(self, planar_state, egopose):
+        rotation = egopose[..., :2, :2].float()
+        return torch.matmul(rotation.unsqueeze(1), planar_state.unsqueeze(-1).float()).squeeze(-1).type_as(planar_state)
+
+    def _compute_heading_from_box(self, bbox_preds):
+        if bbox_preds.size(-1) < 8:
+            heading = bbox_preds.new_zeros(bbox_preds.shape[:-1] + (2,))
+            heading[..., 0] = 1
+            return heading
+        heading = torch.stack([bbox_preds[..., 7], bbox_preds[..., 6]], dim=-1)
+        return F.normalize(heading, dim=-1, eps=1e-6)
+
+    def _get_vehicle_memory_mask(self):
+        if not self.use_vehicle_kinematics or len(self.vehicle_class_ids) == 0 or self.memory_label is None:
+            return None
+
+        vehicle_ids = torch.as_tensor(self.vehicle_class_ids, device=self.memory_label.device, dtype=self.memory_label.dtype)
+        return (self.memory_label.unsqueeze(-1) == vehicle_ids.view(1, 1, -1)).any(dim=-1)
+
+    def _get_memory_scores_and_labels(self, cls_scores):
+        if self.loss_cls.use_sigmoid:
+            probabilities = cls_scores.sigmoid()
+            scores, labels = probabilities.max(dim=-1)
+            return scores.unsqueeze(-1), labels
+
+        probabilities = cls_scores.softmax(dim=-1)
+        scores, labels = probabilities[..., :-1].max(dim=-1)
+        return scores.unsqueeze(-1), labels
+
+    def _fuse_vehicle_heading(self, detected_heading, delta_xy, dt_scale, valid_dt, vehicle_mask=None):
+        motion_speed = torch.linalg.norm(delta_xy, dim=-1, keepdim=True) / dt_scale.to(delta_xy.dtype).clamp(min=1e-6)
+        motion_heading = F.normalize(delta_xy, dim=-1, eps=1e-6)
+        aligned_detected_heading = torch.where(
+            (detected_heading * motion_heading).sum(dim=-1, keepdim=True) < 0,
+            -detected_heading,
+            detected_heading,
+        )
+        fused_heading = F.normalize(
+            aligned_detected_heading * self.vehicle_detected_heading_weight + motion_heading * self.vehicle_motion_heading_weight,
+            dim=-1,
+            eps=1e-6,
+        )
+        valid_motion = valid_dt & (motion_speed > self.vehicle_motion_heading_speed_threshold)
+        if vehicle_mask is not None:
+            valid_motion = valid_motion & vehicle_mask.unsqueeze(-1)
+        return torch.where(valid_motion, fused_heading, detected_heading)
+
+    def _update_vehicle_kinematics_debug(self, raw_reference_points, propagated_reference_points):
+        if not self.debug_vehicle_kinematics or raw_reference_points is None or propagated_reference_points is None:
+            self.debug_last_vehicle_kinematics = None
+            return
+
+        vehicle_mask = self._get_vehicle_memory_mask()
+        if vehicle_mask is None:
+            self.debug_last_vehicle_kinematics = None
+            return
+
+        entries = []
+        max_items = max(int(self.debug_vehicle_kinematics_max), 0)
+        for batch_idx in range(raw_reference_points.size(0)):
+            vehicle_indices = torch.nonzero(vehicle_mask[batch_idx], as_tuple=False).squeeze(-1)
+            if vehicle_indices.numel() == 0:
+                entries.append(None)
+                continue
+
+            if max_items > 0:
+                vehicle_indices = vehicle_indices[:max_items]
+            elif max_items == 0:
+                entries.append(None)
+                continue
+
+            heading = F.normalize(self.memory_heading[batch_idx, vehicle_indices], dim=-1, eps=1e-6)
+            speed = (self.memory_velo[batch_idx, vehicle_indices] * heading).sum(dim=-1)
+            entries.append(dict(
+                raw_xy=raw_reference_points[batch_idx, vehicle_indices, :2].detach().cpu().numpy(),
+                propagated_xy=propagated_reference_points[batch_idx, vehicle_indices, :2].detach().cpu().numpy(),
+                heading=heading.detach().cpu().numpy(),
+                labels=self.memory_label[batch_idx, vehicle_indices].detach().cpu().numpy(),
+                dt=self.memory_timestamp[batch_idx, vehicle_indices, 0].detach().cpu().numpy(),
+                yaw_rate=self.memory_yaw_rate[batch_idx, vehicle_indices, 0].detach().cpu().numpy(),
+                speed=speed.detach().cpu().numpy(),
+                slot_indices=vehicle_indices.detach().cpu().numpy(),
+            ))
+
+        self.debug_last_vehicle_kinematics = dict(
+            pc_range=self.pc_range.detach().cpu().numpy(),
+            entries=entries,
+        )
+
+    def _propagate_vehicle_memory(self, memory_reference_point):
+        if not self.use_vehicle_kinematics or self.memory_timestamp is None or self.memory_heading is None or self.memory_yaw_rate is None or self.memory_velo is None:
+            return memory_reference_point
+
+        vehicle_mask = self._get_vehicle_memory_mask()
+        if vehicle_mask is None or not vehicle_mask.any():
+            return memory_reference_point
+
+        propagated_count = min(self.num_propagated, memory_reference_point.size(1), vehicle_mask.size(1))
+        if propagated_count <= 0:
+            return memory_reference_point
+
+        propagated_vehicle_mask = vehicle_mask.new_zeros(vehicle_mask.shape)
+        propagated_vehicle_mask[:, :propagated_count] = vehicle_mask[:, :propagated_count]
+        if not propagated_vehicle_mask.any():
+            return memory_reference_point
+
+        dt = self.memory_timestamp[..., 0].to(memory_reference_point.dtype)
+        heading = F.normalize(self.memory_heading, dim=-1, eps=1e-6)
+        yaw = torch.atan2(heading[..., 1], heading[..., 0])
+        yaw_rate = self.memory_yaw_rate[..., 0].to(memory_reference_point.dtype)
+        forward_speed = (self.memory_velo.to(memory_reference_point.dtype) * heading).sum(dim=-1)
+        if self.vehicle_speed_limit is not None:
+            forward_speed = forward_speed.clamp(min=-self.vehicle_speed_limit, max=self.vehicle_speed_limit)
+
+        delta_xy = memory_reference_point.new_zeros(memory_reference_point.shape[:-1] + (2,))
+        straight_mask = yaw_rate.abs() < self.vehicle_yaw_rate_threshold
+        straight_dx = forward_speed * dt * torch.cos(yaw)
+        straight_dy = forward_speed * dt * torch.sin(yaw)
+
+        safe_yaw_rate = torch.where(straight_mask, torch.ones_like(yaw_rate), yaw_rate)
+        next_yaw = yaw + yaw_rate * dt
+        radius = forward_speed / safe_yaw_rate
+        turn_dx = radius * (torch.sin(next_yaw) - torch.sin(yaw))
+        turn_dy = radius * (-torch.cos(next_yaw) + torch.cos(yaw))
+
+        delta_xy[..., 0] = torch.where(straight_mask, straight_dx, turn_dx)
+        delta_xy[..., 1] = torch.where(straight_mask, straight_dy, turn_dy)
+
+        propagated_reference = memory_reference_point.clone()
+        propagated_reference[..., :2] = torch.where(
+            propagated_vehicle_mask.unsqueeze(-1),
+            propagated_reference[..., :2] + delta_xy,
+            propagated_reference[..., :2],
+        )
+        return propagated_reference
+
+    def _estimate_query_kinematics(self, bbox_preds):
+        num_queries = bbox_preds.size(1)
+        query_velocity = bbox_preds.new_zeros(bbox_preds.size(0), num_queries, 2)
+        query_yaw_rate = bbox_preds.new_zeros(bbox_preds.size(0), num_queries, 1)
+        query_heading = self._compute_heading_from_box(bbox_preds)
+
+        if self.num_propagated <= 0 or self.memory_timestamp is None or self.memory_reference_point is None:
+            return query_velocity, query_heading, query_yaw_rate
+
+        propagated_count = min(self.num_propagated, num_queries, self.memory_timestamp.size(1), self.memory_reference_point.size(1))
+        if propagated_count <= 0:
+            return query_velocity, query_heading, query_yaw_rate
+
+        propagated_slice = slice(num_queries - propagated_count, num_queries)
+        prev_reference = self.memory_reference_point[:, :propagated_count, :2].to(bbox_preds.dtype)
+        current_reference = bbox_preds[:, propagated_slice, :2]
+        dt = self.memory_timestamp[:, :propagated_count].to(bbox_preds.dtype)
+        valid_dt = dt.abs() > 1e-6
+        dt_scale = dt.abs().clamp(min=1e-6)
+        delta_xy = current_reference - prev_reference
+        planar_velocity = torch.where(valid_dt, delta_xy / dt_scale, torch.zeros_like(delta_xy))
+
+        detected_heading = query_heading[:, propagated_slice]
+        propagated_vehicle_mask = None
+        if self.use_vehicle_kinematics:
+            vehicle_mask = self._get_vehicle_memory_mask()
+            if vehicle_mask is not None:
+                propagated_vehicle_mask = vehicle_mask[:, :propagated_count]
+        fused_heading = self._fuse_vehicle_heading(detected_heading, delta_xy, dt_scale, valid_dt, propagated_vehicle_mask)
+        query_heading[:, propagated_slice] = fused_heading
+        forward_speed = (planar_velocity * fused_heading).sum(dim=-1, keepdim=True)
+        if self.vehicle_speed_limit is not None:
+            forward_speed = forward_speed.clamp(min=-self.vehicle_speed_limit, max=self.vehicle_speed_limit)
+        propagated_velocity = fused_heading * forward_speed
+        if propagated_vehicle_mask is not None:
+            propagated_velocity = torch.where(
+                propagated_vehicle_mask.unsqueeze(-1),
+                propagated_velocity,
+                torch.zeros_like(propagated_velocity),
+            )
+        query_velocity[:, propagated_slice] = propagated_velocity
+
+        if self.memory_heading is not None and self.memory_heading.size(1) >= propagated_count:
+            prev_heading = F.normalize(self.memory_heading[:, :propagated_count], dim=-1, eps=1e-6)
+            prev_yaw = torch.atan2(prev_heading[..., 1], prev_heading[..., 0])
+            current_yaw = torch.atan2(fused_heading[..., 1], fused_heading[..., 0])
+            delta_yaw = self._wrap_angle(current_yaw - prev_yaw).unsqueeze(-1)
+            propagated_yaw_rate = torch.where(
+                valid_dt,
+                delta_yaw / dt_scale,
+                torch.zeros_like(delta_yaw),
+            )
+            if propagated_vehicle_mask is not None:
+                propagated_yaw_rate = torch.where(
+                    propagated_vehicle_mask.unsqueeze(-1),
+                    propagated_yaw_rate,
+                    torch.zeros_like(propagated_yaw_rate),
+                )
+            query_yaw_rate[:, propagated_slice] = propagated_yaw_rate
+
+        return query_velocity, query_heading, query_yaw_rate
 
     def pre_update_memory(self, data):
         x = data['prev_exists']
         B = x.size(0)
+        prev_mask = x.view(B, 1).bool()
         # refresh the memory when the scene changes
         if self.memory_embedding is None:
             self.memory_embedding = x.new_zeros(B, self.memory_len, self.embed_dims)
@@ -492,50 +719,76 @@ class FarHead(AnchorFreeHead):
             self.memory_timestamp = x.new_zeros(B, self.memory_len, 1)
             self.memory_egopose = x.new_zeros(B, self.memory_len, 4, 4)
             self.memory_velo = x.new_zeros(B, self.memory_len, 2)
+            self.memory_heading = x.new_zeros(B, self.memory_len, 2)
+            self.memory_yaw_rate = x.new_zeros(B, self.memory_len, 1)
+            self.memory_label = torch.full((B, self.memory_len), -1, dtype=torch.long, device=x.device)
         else:
             self.memory_timestamp += data['timestamp'].unsqueeze(-1).unsqueeze(-1)
             self.memory_egopose = data['ego_pose_inv'].unsqueeze(1) @ self.memory_egopose # [ B, memory_len, 4, 4], transform to current ego coordinate
             self.memory_reference_point = transform_reference_points(self.memory_reference_point, data['ego_pose_inv'], reverse=False) # transform to current ego coordinate
+            self.memory_velo = self._rotate_planar_state(self.memory_velo, data['ego_pose_inv'])
+            self.memory_heading = self._rotate_planar_state(self.memory_heading, data['ego_pose_inv'])
             self.memory_timestamp = memory_refresh(self.memory_timestamp[:, :self.memory_len], x)
             self.memory_reference_point = memory_refresh(self.memory_reference_point[:, :self.memory_len], x)
             self.memory_embedding = memory_refresh(self.memory_embedding[:, :self.memory_len], x)
             self.memory_egopose = memory_refresh(self.memory_egopose[:, :self.memory_len], x)
             self.memory_velo = memory_refresh(self.memory_velo[:, :self.memory_len], x)
+            self.memory_heading = memory_refresh(self.memory_heading[:, :self.memory_len], x)
+            self.memory_yaw_rate = memory_refresh(self.memory_yaw_rate[:, :self.memory_len], x)
+            self.memory_label = torch.where(prev_mask, self.memory_label[:, :self.memory_len], torch.full_like(self.memory_label[:, :self.memory_len], -1))
         
         # for the first frame, padding pseudo_reference_points (non-learnable)
         if self.num_propagated > 0:
             pseudo_reference_points = self.pseudo_reference_points.weight * (self.pc_range[3:6] - self.pc_range[0:3]) + self.pc_range[0:3] # 실제 ego 좌표계로 denormalize
             self.memory_reference_point[:, :self.num_propagated]  = self.memory_reference_point[:, :self.num_propagated] + (1 - x).view(B, 1, 1) * pseudo_reference_points # for the first frame, add the pseudo reference points to memory
             self.memory_egopose[:, :self.num_propagated]  = self.memory_egopose[:, :self.num_propagated] + (1 - x).view(B, 1, 1, 1) * torch.eye(4, device=x.device) # for the first frame, add the pseudo ego pose to memory
+            self.memory_heading[:, :self.num_propagated] = self.memory_heading[:, :self.num_propagated] * x.view(B, 1, 1)
+            self.memory_yaw_rate[:, :self.num_propagated] = self.memory_yaw_rate[:, :self.num_propagated] * x.view(B, 1, 1)
+            self.memory_velo[:, :self.num_propagated] = self.memory_velo[:, :self.num_propagated] * x.view(B, 1, 1)
+            self.memory_label[:, :self.num_propagated] = torch.where(prev_mask, self.memory_label[:, :self.num_propagated], torch.full_like(self.memory_label[:, :self.num_propagated], -1))
 
     def post_update_memory(self, data, rec_ego_pose, all_cls_scores, all_bbox_preds, outs_dec, mask_dict):
+        query_velocity, query_heading, query_yaw_rate = self._estimate_query_kinematics(all_bbox_preds[-1])
+        rec_score, query_labels = self._get_memory_scores_and_labels(all_cls_scores[-1])
+
         if self.training and mask_dict and mask_dict['pad_size'] > 0:
             rec_reference_points = all_bbox_preds[:, :, mask_dict['pad_size']:, :3][-1]
-            rec_velo = all_bbox_preds[:, :, mask_dict['pad_size']:, -2:][-1]
             rec_memory = outs_dec[:, :, mask_dict['pad_size']:, :][-1]
-            rec_score = all_cls_scores[:, :, mask_dict['pad_size']:, :][-1].sigmoid().topk(1, dim=-1).values[..., 0:1]
+            rec_score = rec_score[:, mask_dict['pad_size']:, :]
             rec_timestamp = torch.zeros_like(rec_score, dtype=torch.float64)
+            rec_ego_pose = rec_ego_pose[:, mask_dict['pad_size']:, :, :]
+            query_velocity = query_velocity[:, mask_dict['pad_size']:, :]
+            query_heading = query_heading[:, mask_dict['pad_size']:, :]
+            query_yaw_rate = query_yaw_rate[:, mask_dict['pad_size']:, :]
+            query_labels = query_labels[:, mask_dict['pad_size']:]
         else:
             rec_reference_points = all_bbox_preds[..., :3][-1]
-            rec_velo = all_bbox_preds[..., -2:][-1]
             rec_memory = outs_dec[-1]
-            rec_score = all_cls_scores[-1].sigmoid().topk(1, dim=-1).values[..., 0:1]
             rec_timestamp = torch.zeros_like(rec_score, dtype=torch.float64)
-        
+
         # topk proposals
-        _, topk_indexes = torch.topk(rec_score, self.topk_proposals, dim=1)
+        topk_count = min(self.topk_proposals, rec_score.size(1))
+        _, topk_indexes = torch.topk(rec_score, topk_count, dim=1)
         rec_timestamp = topk_gather(rec_timestamp, topk_indexes) # [B, topk_proposals, 1]
         rec_reference_points = topk_gather(rec_reference_points, topk_indexes).detach() # [B, topk_proposals, 3]
         rec_memory = topk_gather(rec_memory, topk_indexes).detach() # [B, topk_proposals, embed_dims]
         rec_ego_pose = topk_gather(rec_ego_pose, topk_indexes) # [B, topk_proposals, 4, 4]
-        rec_velo = topk_gather(rec_velo, topk_indexes).detach() # [B, topk_proposals, 2]
+        rec_velo = topk_gather(query_velocity, topk_indexes).detach() # [B, topk_proposals, 2]
+        rec_heading = topk_gather(query_heading, topk_indexes).detach() # [B, topk_proposals, 2]
+        rec_yaw_rate = topk_gather(query_yaw_rate, topk_indexes).detach() # [B, topk_proposals, 1]
+        rec_label = topk_gather(query_labels.unsqueeze(-1), topk_indexes).squeeze(-1).detach().long()
 
         self.memory_embedding = torch.cat([rec_memory, self.memory_embedding], dim=1) # [ B, topk_proposals+memory_len, embed_dims]
         self.memory_timestamp = torch.cat([rec_timestamp, self.memory_timestamp], dim=1) # [B, topk_proposals+memory_len, 1]
         self.memory_egopose= torch.cat([rec_ego_pose, self.memory_egopose], dim=1) # [B, topk_proposals+memory_len, 4, 4]
         self.memory_reference_point = torch.cat([rec_reference_points, self.memory_reference_point], dim=1) # [B, topk_proposals+memory_len, 3]
         self.memory_velo = torch.cat([rec_velo, self.memory_velo], dim=1) # [B, topk_proposals+memory_len, 2]
+        self.memory_heading = torch.cat([rec_heading, self.memory_heading], dim=1) # [B, topk_proposals+memory_len, 2]
+        self.memory_yaw_rate = torch.cat([rec_yaw_rate, self.memory_yaw_rate], dim=1) # [B, topk_proposals+memory_len, 1]
+        self.memory_label = torch.cat([rec_label, self.memory_label], dim=1)
         self.memory_reference_point = transform_reference_points(self.memory_reference_point, data['ego_pose'], reverse=False) # transform to global coordinate
+        self.memory_velo = self._rotate_planar_state(self.memory_velo, data['ego_pose'])
+        self.memory_heading = self._rotate_planar_state(self.memory_heading, data['ego_pose'])
         self.memory_timestamp -= data['timestamp'].unsqueeze(-1).unsqueeze(-1) # update to current timestamp
         self.memory_egopose = data['ego_pose'].unsqueeze(1) @ self.memory_egopose # [B, topk_proposals+memory_len, 4, 4], ego pose to global
     

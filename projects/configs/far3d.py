@@ -18,6 +18,9 @@ class_names = ['ARTICULATED_BUS', 'BICYCLE', 'BICYCLIST', 'BOLLARD', 'BOX_TRUCK'
                'MOTORCYCLIST', 'PEDESTRIAN', 'REGULAR_VEHICLE', 'SCHOOL_BUS', 'SIGN',
                'STOP_SIGN', 'STROLLER', 'TRUCK', 'TRUCK_CAB', 'VEHICULAR_TRAILER',
                'WHEELCHAIR', 'WHEELED_DEVICE','WHEELED_RIDER']
+vehicle_class_names = ['ARTICULATED_BUS', 'BOX_TRUCK', 'BUS', 'LARGE_VEHICLE',
+                       'REGULAR_VEHICLE', 'SCHOOL_BUS', 'TRUCK', 'TRUCK_CAB']
+vehicle_class_ids = [class_names.index(name) for name in vehicle_class_names]
 
 num_gpus = 1
 batch_size = 2
@@ -89,6 +92,10 @@ model = dict(
         num_smp_per_gt=3,
         with_dn=True,
         with_ego_pos=True,
+        use_vehicle_kinematics=True,
+        vehicle_class_ids=vehicle_class_ids,
+        debug_vehicle_kinematics=False,
+        debug_vehicle_kinematics_max=64,
         add_query_from_2d=True,
         pred_box_var=False,  # note add box uncertainty
         depthnet_config=depthnet_config,

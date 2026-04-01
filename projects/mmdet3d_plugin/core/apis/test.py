@@ -253,18 +253,129 @@ def _save_projected_3d_boxes(data, vis_result, show_dir, rank, class_names=None)
     return True
 
 
+def _draw_vehicle_kinematics_bev(canvas, raw_xy, propagated_xy, heading, labels, speed, yaw_rate, slot_indices, class_names, pc_range):
+    height, width = canvas.shape[:2]
+    x_min, y_min, _, x_max, y_max, _ = pc_range
+    span_x = max(float(x_max - x_min), 1e-6)
+    span_y = max(float(y_max - y_min), 1e-6)
+
+    def to_canvas(point_xy):
+        px = int(np.clip((point_xy[0] - x_min) / span_x * (width - 1), 0, width - 1))
+        py = int(np.clip((1.0 - (point_xy[1] - y_min) / span_y) * (height - 1), 0, height - 1))
+        return px, py
+
+    cv2.rectangle(canvas, (0, 0), (width - 1, height - 1), (70, 70, 70), 1)
+    axis_x0, axis_y0 = to_canvas((0.0, 0.0))
+    cv2.line(canvas, (axis_x0, 0), (axis_x0, height - 1), (55, 55, 55), 1)
+    cv2.line(canvas, (0, axis_y0), (width - 1, axis_y0), (55, 55, 55), 1)
+
+    for idx in range(raw_xy.shape[0]):
+        class_id = int(labels[idx])
+        color = _class_color(class_id)
+        raw_pt = to_canvas(raw_xy[idx])
+        prop_pt = to_canvas(propagated_xy[idx])
+        cv2.circle(canvas, raw_pt, 4, (200, 200, 200), -1)
+        cv2.arrowedLine(canvas, raw_pt, prop_pt, color, 2, tipLength=0.25)
+        heading_tip = propagated_xy[idx] + heading[idx] * 1.5
+        cv2.arrowedLine(canvas, prop_pt, to_canvas(heading_tip), color, 1, tipLength=0.3)
+        label_text = f'#{int(slot_indices[idx])} {_class_name(class_names, class_id)} v={float(speed[idx]):.1f} yaw={float(yaw_rate[idx]):.2f}'
+        cv2.putText(canvas, label_text, (prop_pt[0] + 4, max(15, prop_pt[1] - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1, cv2.LINE_AA)
+
+
+def _save_vehicle_kinematics_debug(model, data, show_dir, rank, class_names=None):
+    if show_dir is None:
+        return False
+
+    module = model.module if hasattr(model, 'module') else model
+    pts_bbox_head = getattr(module, 'pts_bbox_head', None)
+    debug_info = getattr(pts_bbox_head, 'debug_last_vehicle_kinematics', None)
+    if not isinstance(debug_info, dict):
+        return False
+
+    entries = debug_info.get('entries')
+    pc_range = np.asarray(debug_info.get('pc_range'))
+    if not isinstance(entries, list) or pc_range.shape[0] < 6:
+        return False
+
+    img_metas_raw = _unwrap_batch_item(data.get('img_metas'))
+    if img_metas_raw is None:
+        return False
+    if isinstance(img_metas_raw, dict):
+        img_metas = [img_metas_raw]
+    else:
+        img_metas = list(img_metas_raw)
+
+    rank_dir = osp.join(show_dir, f'rank_{rank}', 'vehicle_kinematics_debug')
+    mmcv.mkdir_or_exist(rank_dir)
+    saved = False
+    sample_count = min(len(entries), len(img_metas))
+    for sample_idx in range(sample_count):
+        entry = entries[sample_idx]
+        if entry is None or len(entry.get('raw_xy', [])) == 0:
+            continue
+
+        raw_xy = np.nan_to_num(np.asarray(entry['raw_xy']), nan=0.0, posinf=0.0, neginf=0.0)
+        propagated_xy = np.nan_to_num(np.asarray(entry['propagated_xy']), nan=0.0, posinf=0.0, neginf=0.0)
+        heading = np.nan_to_num(np.asarray(entry['heading']), nan=0.0, posinf=0.0, neginf=0.0)
+        labels = np.asarray(entry['labels'])
+        dt = np.nan_to_num(np.asarray(entry['dt']), nan=0.0, posinf=0.0, neginf=0.0)
+        speed = np.nan_to_num(np.asarray(entry['speed']), nan=0.0, posinf=0.0, neginf=0.0)
+        yaw_rate = np.nan_to_num(np.asarray(entry['yaw_rate']), nan=0.0, posinf=0.0, neginf=0.0)
+        slot_indices = np.asarray(entry['slot_indices'])
+
+        canvas = np.full((1024, 1024, 3), 18, dtype=np.uint8)
+        _draw_vehicle_kinematics_bev(
+            canvas,
+            raw_xy,
+            propagated_xy,
+            heading,
+            labels,
+            speed,
+            yaw_rate,
+            slot_indices,
+            class_names,
+            pc_range,
+        )
+
+        sample_meta = img_metas[sample_idx]
+        sample_name = str(sample_meta.get('sample_idx') or sample_meta.get('scene_token') or sample_meta.get('lidar_timestamp') or sample_idx)
+        image_path = osp.join(rank_dir, f'{sample_name}_vehicle_kinematics_bev.jpg')
+        mmcv.imwrite(canvas, image_path)
+        np.savez(
+            osp.join(rank_dir, f'{sample_name}_vehicle_kinematics_bev.npz'),
+            raw_xy=raw_xy,
+            propagated_xy=propagated_xy,
+            heading=heading,
+            labels=labels,
+            dt=dt,
+            speed=speed,
+            yaw_rate=yaw_rate,
+            slot_indices=slot_indices,
+            pc_range=pc_range,
+        )
+        saved = True
+
+    return saved
+
+
 def _run_show_results(model, data, result, show, show_dir, rank, class_names=None):
     if not (show or show_dir):
         return
 
+    debug_saved = _save_vehicle_kinematics_debug(model, data, show_dir, rank, class_names=class_names)
+
     vis_result = _to_visual_results(result)
     if vis_result is None:
+        if debug_saved:
+            return
         warnings.warn('Unable to map prediction result to visualization format.')
         return
 
     module = model.module if hasattr(model, 'module') else model
     show_fn = getattr(module, 'show_results', None)
     if show_fn is None:
+        if debug_saved or _save_projected_3d_boxes(data, vis_result, show_dir, rank, class_names=class_names):
+            return
         warnings.warn('`--show`/`--show-dir` requested but model has no show_results method.')
         return
 
@@ -278,16 +389,17 @@ def _run_show_results(model, data, result, show, show_dir, rank, class_names=Non
     for call in call_patterns:
         try:
             call()
+            _save_projected_3d_boxes(data, vis_result, show_dir, rank, class_names=class_names)
             return
         except TypeError as err:
             last_error = err
         except KeyError as err:
             if str(err).strip("'") == 'points':
-                if _save_projected_3d_boxes(data, vis_result, show_dir, rank, class_names=class_names):
+                if _save_projected_3d_boxes(data, vis_result, show_dir, rank, class_names=class_names) or debug_saved:
                     return
             raise
 
-    if _save_projected_3d_boxes(data, vis_result, show_dir, rank, class_names=class_names):
+    if _save_projected_3d_boxes(data, vis_result, show_dir, rank, class_names=class_names) or debug_saved:
         return
 
     warnings.warn(

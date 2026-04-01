@@ -23,6 +23,8 @@ class_names = [
     'car', 'truck', 'construction_vehicle', 'bus', 'trailer', 'barrier',
     'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'
 ]
+vehicle_class_names = ['car', 'truck', 'construction_vehicle', 'bus']
+vehicle_class_ids = [0, 1, 2, 3]
 num_gpus = 1
 batch_size = 1
 num_iters_per_epoch = 28130
@@ -108,6 +110,10 @@ model = dict(
         num_smp_per_gt=3,
         with_dn=True,
         with_ego_pos=True,
+        use_vehicle_kinematics=True,
+        vehicle_class_ids=[0, 1, 2, 3],
+        debug_vehicle_kinematics=False,
+        debug_vehicle_kinematics_max=64,
         add_query_from_2d=True,
         pred_box_var=False,
         depthnet_config=dict(
