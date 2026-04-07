@@ -522,7 +522,7 @@ class DeformableFeatureAggregationCuda(BaseModule):
     def forward(self, instance_feature, query_pos,feat_flatten, reference_points, spatial_flatten, level_start_index, pc_range, lidar2img_mat, img_metas):
         bs, num_anchor = reference_points.shape[:2]
         reference_points = get_global_pos(reference_points, pc_range)
-        key_points = reference_points.unsqueeze(-2) + self.learnable_fc(instance_feature).reshape(bs, num_anchor, -1, 3)
+        key_points = reference_points.unsqueeze(-2) + self.learnable_fc(instance_feature).reshape(bs, num_anchor, -1, 3) # p + Δp [B, num_anchor, num_key_pts, 3]
         # key_points_ = key_points.cpu().numpy()
         weights = self._get_weights(instance_feature, query_pos, lidar2img_mat) # [N, ]
 
@@ -551,7 +551,7 @@ class DeformableFeatureAggregationCuda(BaseModule):
         points_2d[..., 0:1] = points_2d[..., 0:1] / img_metas[0]['pad_shape'][0][1]
         points_2d[..., 1:2] = points_2d[..., 1:2] / img_metas[0]['pad_shape'][0][0]
 
-        points_2d = points_2d.flatten(end_dim=1) #[b*7, 900, 13, 2]
+        points_2d = points_2d.flatten(end_dim=1) #[b*N, query, key_points, 2(x,y)]
         points_2d = points_2d[:, :, None, None, :, :].repeat(1, 1, self.num_groups, self.num_levels, 1, 1)
         # print(points_2d)
 

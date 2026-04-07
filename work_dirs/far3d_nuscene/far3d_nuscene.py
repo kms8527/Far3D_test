@@ -569,7 +569,7 @@ lr_config = dict(
     warmup_ratio=0.3333333333333333,
     min_lr_ratio=0.001)
 evaluation = dict(
-    interval=675120,
+    interval=28130,
     pipeline=[
         dict(type='NuScenesLoadMultiViewImageFromFiles', to_float32=True),
         dict(
@@ -617,7 +617,9 @@ evaluation = dict(
                                'box_mode_3d', 'box_type_3d', 'img_norm_cfg',
                                'scene_token'))
             ])
-    ])
+    ],
+    save_best='auto',
+    rule='greater')
 find_unused_parameters = False
 runner = dict(type='IterBasedRunner', max_iters=675120)
 gpu_ids = range(0, 1)

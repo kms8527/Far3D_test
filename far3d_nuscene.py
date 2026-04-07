@@ -23,7 +23,7 @@ class_names = [
     'car', 'truck', 'construction_vehicle', 'bus', 'trailer', 'barrier',
     'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'
 ]
-num_gpus = 8
+num_gpus = 4
 batch_size = 1
 num_iters_per_epoch = 3516
 num_epochs = 24
@@ -563,7 +563,9 @@ lr_config = dict(
     warmup_ratio=0.3333333333333333,
     min_lr_ratio=0.001)
 evaluation = dict(
-    interval=84384,
+    interval=num_iters_per_epoch,
+    save_best='auto',
+    rule='greater',
     pipeline=[
         dict(type='NuScenesLoadMultiViewImageFromFiles', to_float32=True),
         dict(
