@@ -4,8 +4,8 @@ import json
 from visual_nuscenes import NuScenes
 use_gt = False
 out_dir = './result_vis/'
-result_json = "work_dirs/pp-nus/results_eval/pts_bbox/results_nusc"
-dataroot='/data/nuscenes'
+result_json = "work_dirs/pp-far3d_nuscene/results_eval/pts_bbox/results_nusc"
+dataroot='./data/nuscenes'
 if not os.path.exists(out_dir):
     os.mkdir(out_dir)
 

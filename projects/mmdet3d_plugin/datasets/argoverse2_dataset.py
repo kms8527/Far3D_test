@@ -247,7 +247,7 @@ class Argoverse2Dataset(Custom3DDataset):
         gts = gts.loc[list(valid_uuids)].sort_index()
 
         categories = set(x.value for x in CompetitionCategories)
-        categories &= set(gts["category"].unique().tolist())  # 交集
+        categories &= set(gts["category"].unique().tolist())  # Intersection.
         split_dir = Path(self.data_root) / self.split
         cfg = DetectionCfg(
             dataset_dir=split_dir,
@@ -338,7 +338,6 @@ class Argoverse2Dataset(Custom3DDataset):
         quat = yaw_to_quat(yaw)
         argo_cuboid = torch.cat([cnt_xyz, lwh, quat], dim=1)
         return argo_cuboid
-
 
 
 

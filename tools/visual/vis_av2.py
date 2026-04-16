@@ -10,7 +10,7 @@ import importlib
 import numpy as np
 import cv2
 import torch
-#红色为pred，绿色为gt
+# Red is prediction, green is ground truth.
 idx = 13
 score_thr = 0.25
 num_samples = 1500

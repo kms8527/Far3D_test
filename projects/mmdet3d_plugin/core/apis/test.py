@@ -24,7 +24,7 @@ from mmdet.core import encode_mask_results
 import mmcv
 import numpy as np
 import pycocotools.mask as mask_util
-
+from matplotlib import pyplot as plt
 
 def _to_visual_results(result):
     if isinstance(result, dict):
@@ -60,7 +60,7 @@ def _camera_name_from_filename(filename, view_idx):
     if not isinstance(filename, str):
         return f'camera_{view_idx}'
 
-    match = re.search(r'(CAM_(?:FRONT|FRONT_LEFT|FRONT_RIGHT|BACK|BACK_LEFT|BACK_RIGHT))', filename)
+    match = re.search(r'(CAM_(?:FRONT_LEFT|FRONT_RIGHT|FRONT|BACK_LEFT|BACK_RIGHT|BACK))', filename)
     if match is not None:
         return match.group(1)
 
@@ -98,7 +98,291 @@ def _class_name(class_names, class_id):
     return f'class_{int(class_id)}'
 
 
-def _save_projected_3d_boxes(data, vis_result, show_dir, rank, class_names=None):
+def _sample_token_from_meta(sample_meta):
+    for key in ('sample_idx', 'token'):
+        value = sample_meta.get(key)
+        if value is not None:
+            return str(value)
+    return None
+
+
+def _normalize_filename_key(filenames):
+    if filenames is None:
+        return None
+    if isinstance(filenames, str):
+        filenames = [filenames]
+    if not isinstance(filenames, (list, tuple)):
+        return None
+
+    normalized = []
+    for filename in filenames:
+        if filename is None:
+            continue
+        normalized.append(osp.normpath(str(filename)))
+    if not normalized:
+        return None
+    return tuple(normalized)
+
+
+def _dataset_index_from_token(dataset, sample_token):
+    if dataset is None or sample_token is None:
+        return None
+
+    token2idx = getattr(dataset, '_vis_token2idx', None)
+    if token2idx is None:
+        token2idx = {}
+        for index, info in enumerate(getattr(dataset, 'data_infos', [])):
+            token = info.get('token')
+            if token is not None:
+                token2idx[str(token)] = index
+        dataset._vis_token2idx = token2idx
+
+    return token2idx.get(str(sample_token))
+
+
+def _dataset_index_from_filenames(dataset, filenames):
+    key = _normalize_filename_key(filenames)
+    if dataset is None or key is None:
+        return None
+
+    filename2idx = getattr(dataset, '_vis_filename2idx', None)
+    if filename2idx is None:
+        filename2idx = {}
+        for index, info in enumerate(getattr(dataset, 'data_infos', [])):
+            cams = info.get('cams', {})
+            ordered = []
+            for _, cam_info in sorted(cams.items()):
+                data_path = cam_info.get('data_path')
+                if data_path is not None:
+                    ordered.append(osp.normpath(str(data_path)))
+            if ordered:
+                filename2idx[tuple(ordered)] = index
+        dataset._vis_filename2idx = filename2idx
+
+    return filename2idx.get(key)
+
+
+def _to_numpy_labels(labels):
+    if labels is None:
+        return None
+    if isinstance(labels, torch.Tensor):
+        return labels.detach().cpu().numpy()
+    return np.asarray(labels)
+
+
+def _to_numpy_scores(scores):
+    if scores is None:
+        return None
+    if isinstance(scores, torch.Tensor):
+        return scores.detach().cpu().numpy()
+    return np.asarray(scores)
+
+
+def _project_boxes_to_views(boxes_3d, lidar2img):
+    if boxes_3d is None or lidar2img is None:
+        return None
+
+    corners = boxes_3d.corners
+    if isinstance(corners, torch.Tensor):
+        corners = corners.detach().cpu().numpy()
+    else:
+        corners = np.asarray(corners)
+
+    if corners.size == 0:
+        return np.empty((0, lidar2img.shape[0], 8, 4), dtype=np.float32)
+
+    pts = corners.reshape(-1, 3)
+    pts_h = np.concatenate([pts, np.ones((pts.shape[0], 1), dtype=corners.dtype)], axis=1)
+    projected = []
+    for proj in lidar2img:
+        proj_pts = pts_h @ proj.T
+        proj_pts[:, :2] /= np.clip(proj_pts[:, 2:3], 1e-5, None)
+        projected.append(proj_pts.reshape(-1, 8, 4))
+    return np.stack(projected, axis=1)
+
+
+def _draw_line_with_outline(canvas, start_point, end_point, color, thickness):
+    cv2.line(canvas, start_point, end_point, (0, 0, 0), thickness + 2)
+    cv2.line(canvas, start_point, end_point, color, thickness)
+
+
+def _draw_text_with_outline(canvas, text, origin, color, scale=0.45, thickness=1):
+    cv2.putText(
+        canvas,
+        text,
+        origin,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        scale,
+        (0, 0, 0),
+        thickness + 2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        canvas,
+        text,
+        origin,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        scale,
+        color,
+        thickness,
+        cv2.LINE_AA,
+    )
+
+
+def _draw_legend_overlay(canvas, visible_classes):
+    if not visible_classes:
+        return
+
+    lines = []
+    for is_gt, class_id in sorted(visible_classes):
+        cls_name, color = visible_classes[(is_gt, class_id)]
+        prefix = 'GT' if is_gt else 'Pred'
+        lines.append((f'{prefix} {class_id}: {cls_name}', color))
+
+    line_height = 20
+    box_width = 0
+    for text, _ in lines:
+        text_size, _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+        box_width = max(box_width, text_size[0])
+
+    origin_x = 8
+    origin_y = 10
+    box_width = min(box_width + 34, max(1, canvas.shape[1] - origin_x - 8))
+    box_height = min(10 + line_height * len(lines), max(1, canvas.shape[0] - origin_y - 8))
+
+    overlay = canvas.copy()
+    cv2.rectangle(
+        overlay,
+        (origin_x, origin_y),
+        (origin_x + box_width, origin_y + box_height),
+        (20, 20, 20),
+        -1,
+    )
+    cv2.addWeighted(overlay, 0.45, canvas, 0.55, 0, dst=canvas)
+
+    legend_y = origin_y + 18
+    for text, color in lines:
+        cv2.rectangle(canvas, (origin_x + 6, legend_y - 10), (origin_x + 22, legend_y + 4), color, -1)
+        _draw_text_with_outline(canvas, text, (origin_x + 28, legend_y), color)
+        legend_y += line_height
+
+
+def _resolve_view_shape(shape_meta, view_idx):
+    if shape_meta is None:
+        return None
+    if isinstance(shape_meta, np.ndarray):
+        shape_meta = shape_meta.tolist()
+    if isinstance(shape_meta, (list, tuple)):
+        if len(shape_meta) >= 2 and isinstance(shape_meta[0], (int, np.integer)):
+            return int(shape_meta[0]), int(shape_meta[1])
+        if view_idx < len(shape_meta):
+            return _resolve_view_shape(shape_meta[view_idx], view_idx)
+    return None
+
+
+def _crop_to_unpadded_view(view_img, sample_meta, view_idx):
+    view_shape = _resolve_view_shape(sample_meta.get('ori_shape'), view_idx)
+    if view_shape is None:
+        return np.ascontiguousarray(view_img)
+
+    view_h = max(1, min(view_shape[0], view_img.shape[0]))
+    view_w = max(1, min(view_shape[1], view_img.shape[1]))
+    return np.ascontiguousarray(view_img[:view_h, :view_w])
+
+
+def _trim_black_borders(view_img, threshold=2):
+    if view_img.size == 0:
+        return np.ascontiguousarray(view_img), 0, 0
+
+    non_black = np.any(view_img > threshold, axis=2)
+    valid_rows = np.where(non_black.any(axis=1))[0]
+    valid_cols = np.where(non_black.any(axis=0))[0]
+    if len(valid_rows) == 0 or len(valid_cols) == 0:
+        return np.ascontiguousarray(view_img), 0, 0
+
+    top = int(valid_rows[0])
+    bottom = int(valid_rows[-1]) + 1
+    left = int(valid_cols[0])
+    right = int(valid_cols[-1]) + 1
+    trimmed = np.ascontiguousarray(view_img[top:bottom, left:right])
+    return trimmed, left, top
+
+
+def _shift_projected_boxes(boxes_2d, offset_x, offset_y):
+    if boxes_2d is None:
+        return None
+
+    shifted = boxes_2d.copy()
+    shifted[..., 0] -= offset_x
+    shifted[..., 1] -= offset_y
+    return shifted
+
+
+def _draw_projected_boxes(canvas, boxes_2d, labels, edges, class_names=None, scores=None, gt=False):
+    if boxes_2d is None or labels is None or len(labels) == 0:
+        return {}
+
+    visible_classes = {}
+    for box_idx, box in enumerate(boxes_2d):
+        class_id = int(labels[box_idx])
+        cls_name = _class_name(class_names, class_id)
+        color = (255, 255, 255) if gt else _class_color(class_id)
+        visible_classes[(gt, class_id)] = (cls_name, color)
+        visible = []
+        for start, end in edges:
+            if box[start][2] > 0 and box[end][2] > 0:
+                visible.append(start)
+                visible.append(end)
+                _draw_line_with_outline(
+                    canvas,
+                    (int(box[start][0]), int(box[start][1])),
+                    (int(box[end][0]), int(box[end][1])),
+                    color,
+                    2,
+                )
+
+        if visible:
+            vis_points = box[visible, :2]
+            text_x = int(np.min(vis_points[:, 0]))
+            text_y = max(15, int(np.min(vis_points[:, 1])) - 4)
+            if gt:
+                label_text = f'GT:{cls_name}'
+            else:
+                label_text = f'{cls_name}:{float(scores[box_idx]):.2f}' if scores is not None else cls_name
+            _draw_text_with_outline(canvas, label_text, (text_x, text_y), color)
+
+    return visible_classes
+
+
+def _load_gt_annotations(dataset, sample_meta):
+    sample_token = _sample_token_from_meta(sample_meta)
+    dataset_index = _dataset_index_from_token(dataset, sample_token)
+    if dataset_index is None:
+        dataset_index = _dataset_index_from_filenames(dataset, sample_meta.get('filename'))
+    if dataset_index is None:
+        return None, None
+
+    ann_info = dataset.get_ann_info(dataset_index)
+    if not isinstance(ann_info, dict):
+        return None, None
+
+    return ann_info.get('gt_bboxes_3d'), _to_numpy_labels(ann_info.get('gt_labels_3d'))
+
+
+def _load_gt_annotations_by_index(dataset, dataset_index):
+    if dataset is None or dataset_index is None:
+        return None, None
+    if dataset_index < 0 or dataset_index >= len(getattr(dataset, 'data_infos', [])):
+        return None, None
+
+    ann_info = dataset.get_ann_info(dataset_index)
+    if not isinstance(ann_info, dict):
+        return None, None
+
+    return ann_info.get('gt_bboxes_3d'), _to_numpy_labels(ann_info.get('gt_labels_3d'))
+
+
+def _save_projected_3d_boxes(data, vis_result, show_dir, rank, class_names=None, dataset=None, show_gt=False, dataset_start_index=None):
     if show_dir is None:
         return False
 
@@ -135,18 +419,22 @@ def _save_projected_3d_boxes(data, vis_result, show_dir, rank, class_names=None)
             continue
 
         pts_bbox = sample_result['pts_bbox']
-        if 'boxes_3d' not in pts_bbox or 'scores_3d' not in pts_bbox:
+        if 'boxes_3d' not in pts_bbox:
             continue
 
-        scores = pts_bbox['scores_3d'].detach().cpu().numpy()
-        labels = pts_bbox['labels_3d'].detach().cpu().numpy() if 'labels_3d' in pts_bbox else np.zeros_like(scores, dtype=np.int64)
-        score_mask = scores > 0.2
-        if not np.any(score_mask):
-            continue
-
-        corners = pts_bbox['boxes_3d'].corners.detach().cpu().numpy()[score_mask]
-        scores = scores[score_mask]
-        labels = labels[score_mask]
+        scores = _to_numpy_scores(pts_bbox.get('scores_3d'))
+        labels = _to_numpy_labels(pts_bbox.get('labels_3d'))
+        pred_boxes_3d = pts_bbox['boxes_3d']
+        if scores is not None:
+            score_mask = scores > 0.2
+            pred_boxes_3d = pred_boxes_3d[score_mask]
+            scores = scores[score_mask]
+            if labels is None:
+                labels = np.zeros_like(scores, dtype=np.int64)
+            else:
+                labels = labels[score_mask]
+        elif labels is None:
+            labels = np.zeros((len(pred_boxes_3d),), dtype=np.int64)
 
         img_tensor = batch_imgs[sample_idx]
         if img_tensor.dim() != 4:
@@ -175,69 +463,57 @@ def _save_projected_3d_boxes(data, vis_result, show_dir, rank, class_names=None)
         if lidar2img.ndim != 3:
             continue
 
+        pred_boxes_2d = _project_boxes_to_views(pred_boxes_3d, lidar2img)
+        gt_boxes_3d, gt_labels = _load_gt_annotations(dataset, sample_meta) if show_gt else (None, None)
+        if show_gt and gt_boxes_3d is None and dataset_start_index is not None:
+            gt_boxes_3d, gt_labels = _load_gt_annotations_by_index(dataset, dataset_start_index + sample_idx)
+        gt_boxes_2d = _project_boxes_to_views(gt_boxes_3d, lidar2img) if gt_boxes_3d is not None else None
+        if (pred_boxes_2d is None or len(pred_boxes_2d) == 0) and (gt_boxes_2d is None or len(gt_boxes_2d) == 0):
+            continue
+
         sample_name = str(sample_meta.get('sample_idx') or sample_meta.get('scene_token') or sample_meta.get('lidar_timestamp') or sample_idx)
         filenames = sample_meta.get('filename')
         for view_idx, view_img in enumerate(view_images):
             if view_idx >= lidar2img.shape[0]:
                 break
-            proj = lidar2img[view_idx]
-            pts = corners.reshape(-1, 3)
-            pts_h = np.concatenate([pts, np.ones((pts.shape[0], 1), dtype=pts.dtype)], axis=1)
-            proj_pts = pts_h @ proj.T
-            proj_pts[:, :2] /= np.clip(proj_pts[:, 2:3], 1e-5, None)
-            boxes_2d = proj_pts.reshape(-1, 8, 4)
+            # # plot raw image[0]
+            # plt.imshow(sample_meta.get('ori_img', view_img))
+            # plt.show()
 
-            canvas = np.ascontiguousarray(view_img.copy())
+            unpadded_view = _crop_to_unpadded_view(view_img, sample_meta, view_idx)
+            canvas, offset_x, offset_y = _trim_black_borders(unpadded_view)
+            canvas = canvas.copy()
+            pred_view_boxes = _shift_projected_boxes(
+                pred_boxes_2d[:, view_idx] if pred_boxes_2d is not None else None,
+                offset_x,
+                offset_y,
+            )
+            gt_view_boxes = _shift_projected_boxes(
+                gt_boxes_2d[:, view_idx] if gt_boxes_2d is not None else None,
+                offset_x,
+                offset_y,
+            )
             visible_classes = {}
-            for box_idx, box in enumerate(boxes_2d):
-                class_id = int(labels[box_idx])
-                cls_name = _class_name(class_names, class_id)
-                color = _class_color(class_id)
-                visible_classes[class_id] = (cls_name, color)
-                visible = []
-                for start, end in edges:
-                    if box[start][2] > 0 and box[end][2] > 0:
-                        visible.append(start)
-                        visible.append(end)
-                        cv2.line(
-                            canvas,
-                            (int(box[start][0]), int(box[start][1])),
-                            (int(box[end][0]), int(box[end][1])),
-                            color,
-                            2,
-                        )
-
-                if visible:
-                    vis_points = box[visible, :2]
-                    text_x = int(np.min(vis_points[:, 0]))
-                    text_y = max(15, int(np.min(vis_points[:, 1])) - 4)
-                    label_text = f'{cls_name}:{scores[box_idx]:.2f}'
-                    cv2.putText(
-                        canvas,
-                        label_text,
-                        (text_x, text_y),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.45,
-                        color,
-                        1,
-                        cv2.LINE_AA,
-                    )
-
-            legend_y = 20
-            for class_id in sorted(visible_classes):
-                cls_name, color = visible_classes[class_id]
-                cv2.rectangle(canvas, (8, legend_y - 10), (24, legend_y + 4), color, -1)
-                cv2.putText(
-                    canvas,
-                    f'{class_id}: {cls_name}',
-                    (30, legend_y),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.45,
-                    color,
-                    1,
-                    cv2.LINE_AA,
-                )
-                legend_y += 18
+            pred_visible = _draw_projected_boxes(
+                canvas,
+                pred_view_boxes,
+                labels,
+                edges,
+                class_names=class_names,
+                scores=scores,
+                gt=False,
+            )
+            gt_visible = _draw_projected_boxes(
+                canvas,
+                gt_view_boxes,
+                gt_labels,
+                edges,
+                class_names=class_names,
+                gt=True,
+            )
+            visible_classes.update(pred_visible)
+            visible_classes.update(gt_visible)
+            _draw_legend_overlay(canvas, visible_classes)
 
             camera_name = f'camera_{view_idx}'
             if isinstance(filenames, (list, tuple)) and view_idx < len(filenames):
@@ -358,7 +634,7 @@ def _save_vehicle_kinematics_debug(model, data, show_dir, rank, class_names=None
     return saved
 
 
-def _run_show_results(model, data, result, show, show_dir, rank, class_names=None):
+def _run_show_results(model, data, result, show, show_dir, rank, class_names=None, dataset=None, show_gt=False, dataset_start_index=None):
     if not (show or show_dir):
         return
 
@@ -374,7 +650,16 @@ def _run_show_results(model, data, result, show, show_dir, rank, class_names=Non
     module = model.module if hasattr(model, 'module') else model
     show_fn = getattr(module, 'show_results', None)
     if show_fn is None:
-        if debug_saved or _save_projected_3d_boxes(data, vis_result, show_dir, rank, class_names=class_names):
+        if debug_saved or _save_projected_3d_boxes(
+            data,
+            vis_result,
+            show_dir,
+            rank,
+            class_names=class_names,
+            dataset=dataset,
+            show_gt=show_gt,
+            dataset_start_index=dataset_start_index,
+        ):
             return
         warnings.warn('`--show`/`--show-dir` requested but model has no show_results method.')
         return
@@ -389,17 +674,44 @@ def _run_show_results(model, data, result, show, show_dir, rank, class_names=Non
     for call in call_patterns:
         try:
             call()
-            _save_projected_3d_boxes(data, vis_result, show_dir, rank, class_names=class_names)
+            _save_projected_3d_boxes(
+                data,
+                vis_result,
+                show_dir,
+                rank,
+                class_names=class_names,
+                dataset=dataset,
+                show_gt=show_gt,
+                dataset_start_index=dataset_start_index,
+            )
             return
         except TypeError as err:
             last_error = err
         except KeyError as err:
             if str(err).strip("'") == 'points':
-                if _save_projected_3d_boxes(data, vis_result, show_dir, rank, class_names=class_names) or debug_saved:
+                if _save_projected_3d_boxes(
+                    data,
+                    vis_result,
+                    show_dir,
+                    rank,
+                    class_names=class_names,
+                    dataset=dataset,
+                    show_gt=show_gt,
+                    dataset_start_index=dataset_start_index,
+                ) or debug_saved:
                     return
             raise
 
-    if _save_projected_3d_boxes(data, vis_result, show_dir, rank, class_names=class_names) or debug_saved:
+    if _save_projected_3d_boxes(
+        data,
+        vis_result,
+        show_dir,
+        rank,
+        class_names=class_names,
+        dataset=dataset,
+        show_gt=show_gt,
+        dataset_start_index=dataset_start_index,
+    ) or debug_saved:
         return
 
     warnings.warn(
@@ -431,7 +743,8 @@ def custom_multi_gpu_test(model,
                           tmpdir=None,
                           gpu_collect=False,
                           show=False,
-                          show_dir=None):
+                          show_dir=None,
+                          show_gt=False):
     """Test model with multiple gpus.
     This method tests model with multiple gpus and collects the results
     under two different modes: gpu and cpu modes. By setting 'gpu_collect=True'
@@ -474,6 +787,9 @@ def custom_multi_gpu_test(model,
                 show_dir=show_dir,
                 rank=rank,
                 class_names=class_names,
+                dataset=dataset,
+                show_gt=show_gt,
+                dataset_start_index=i * world_size,
             )
 
             # encode mask results

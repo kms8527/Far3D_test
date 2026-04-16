@@ -13,3 +13,4 @@ visualization/**
 test/far3d_nuscene/**
 **.pyc
 visualization_original/**
+visualization**/**

@@ -37,11 +37,11 @@ CompetitionCLASSES = tuple(x.value for x in CompetitionCategories)
 
 def create_av2_infos(dataset_dir, split, out_dir):
     src_dir = dataset_dir / split
-    paths = sorted(src_dir.glob(LIDAR_PATTERN), key=lambda x: int(x.stem))   #每个split包含的所有lidar帧路径
-    records = [convert_path_to_named_record(p) for p in paths]      #每帧信息：split，log_id, sensor_name, timestamp_ns
-    sensor_caches = pd.DataFrame(records)  #pandas形式
-    sensor_caches.set_index(["log_id", "sensor_name", "timestamp_ns"], inplace=True) #将相同场景id的对应帧放在一起
-    sensor_caches.sort_index(inplace=True) #根据场景id排序
+    paths = sorted(src_dir.glob(LIDAR_PATTERN), key=lambda x: int(x.stem))   # All lidar frame paths in the split.
+    records = [convert_path_to_named_record(p) for p in paths]      # Per-frame info: split, log_id, sensor_name, timestamp_ns.
+    sensor_caches = pd.DataFrame(records)  # Stored as a pandas DataFrame.
+    sensor_caches.set_index(["log_id", "sensor_name", "timestamp_ns"], inplace=True) # Group matching frames by scene id.
+    sensor_caches.sort_index(inplace=True) # Sort by scene id.
     loader = SynchronizationDB(dataset_dir=src_dir)
     av2_split_infos = []
     for i in tqdm(range(len(sensor_caches))): 
@@ -59,7 +59,7 @@ def create_av2_infos(dataset_dir, split, out_dir):
         cam_infos = {}
         camera_models = {}
         for cam_name in CAMERAS:
-            #根据lidar timestamp取对应相机的timestamp
+            # Get the corresponding camera timestamp from the lidar timestamp.
             cam_timestamp_ns = loader.get_closest_cam_channel_timestamp(
                 lidar_timestamp=lidar_timestamp_ns, cam_name=cam_name, log_id=log_id)
             if cam_timestamp_ns is None:
@@ -78,8 +78,8 @@ def create_av2_infos(dataset_dir, split, out_dir):
                 fy=params["fy_px"],
                 cx=params["cx_px"],
                 cy=params["cy_px"],
-            ) #内参矩阵
-            distortion = intrinsics_df.loc[cam_name, ["k1", "k2", "k3"]] #畸变系数
+            ) # Intrinsic matrix.
+            distortion = intrinsics_df.loc[cam_name, ["k1", "k2", "k3"]] # Distortion coefficients.
             sensor_name_to_pose = io_utils.read_ego_SE3_sensor(log_dir)
             ego_SE3_cam = sensor_name_to_pose[cam_name] #cam2ego
             city_SE3_ego_cam_t = timestamp_city_SE3_ego_dict[cam_timestamp_ns] #ego2glo at cam timestamp
@@ -94,7 +94,7 @@ def create_av2_infos(dataset_dir, split, out_dir):
             )
             camera_models[cam_name] = camera_model
             
-        infos['cam_infos'] = cam_infos #用于制作2d标签
+        infos['cam_infos'] = cam_infos # Used to build 2D labels.
 
         if split != 'test':
             annotations = _load_annotations(split, log_id, lidar_timestamp_ns)
@@ -105,7 +105,7 @@ def create_av2_infos(dataset_dir, split, out_dir):
             infos['gt3d_infos'] = gt3d_infos
             infos['gt2d_infos'] = gt2d_infos
         
-        #存储所有samples的info
+        # Store info for all samples.
         av2_split_infos.append(infos)
     print('{}_sample:{}'.format(split, len(av2_split_infos)))
     data = dict(infos=av2_split_infos, split=split)

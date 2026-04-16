@@ -17,14 +17,14 @@ from mmdet.core import MlvlPointGenerator
 import matplotlib
 
 '''
-进行以下所需的改动：
+Required changes:
 1. petr3d.py forward_test  if key != 'img' and key != 'gt_bboxes_3d' and key != 'gt_labels_3d'  
-2.argoverse2_dataset_t.py  注释if not self.test_mode  
-3. config  test_pipeline加上LoadAnnotations3D， keys加上'gt_bboxes_3d', 'gt_labels_3d'  
-4.可以使用mini pkl
+2. In argoverse2_dataset_t.py, comment out `if not self.test_mode`.
+3. In the config, add `LoadAnnotations3D` to `test_pipeline`, and add `'gt_bboxes_3d', 'gt_labels_3d'` to the keys.
+4. You can use a mini pkl file.
 5. If needed, set vis_return_ref3d=True in config; and modify below receiving part.
-6. 如果使用 depths, gt_2dbox 等，需要再 AV2Resize里注释掉 self.training，并在 keys 中添加上 'ins_depthmap' 等
-7. 使用 ref_dict 的话在本文件中加入 ref_dict 相关，及 petr3d.py 中恢复 ref_dict 相关
+6. If you use depths, gt_2dbox, etc., comment out `self.training` in `AV2Resize`, and add keys such as `'ins_depthmap'`.
+7. If you use `ref_dict`, add the related handling in this file and restore the related `ref_dict` code in `petr3d.py`.
 '''
 
 colors = matplotlib.cm.get_cmap("plasma")

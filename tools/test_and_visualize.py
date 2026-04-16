@@ -51,6 +51,10 @@ def parse_args():
     parser.add_argument(
         '--show-dir', help='directory where results will be saved')
     parser.add_argument(
+        '--show-gt',
+        action='store_true',
+        help='overlay GT 3D boxes together with predictions when using --show/--show-dir')
+    parser.add_argument(
         '--gpu-collect',
         action='store_true',
         help='whether to use gpu to collect results.')
@@ -231,10 +235,10 @@ def main():
             broadcast_buffers=False)
         outputs = custom_multi_gpu_test(model, data_loader, args.tmpdir,
                                         args.gpu_collect, args.show,
-                                        args.show_dir)
+                                        args.show_dir, args.show_gt)
 
 
-    # 此前均不变，到此处一一转向，可在另一处写 method
+    # Everything above remains unchanged; branching logic can be implemented elsewhere from this point.
 
     '''
     outputs format:

@@ -192,7 +192,7 @@ train_pipeline = [
 ]
 test_pipeline = [
     dict(type='NuScenesLoadMultiViewImageFromFiles', to_float32=True),
-    dict(type='NuScenesResizeCropFlipRotImageV2', data_aug_conf=ida_aug_conf),
+    # dict(type='NuScenesResizeCropFlipRotImageV2', data_aug_conf=ida_aug_conf),
     dict(type='NormalizeMultiviewImage', **img_norm_cfg),
     dict(type='NuScenesPadMultiViewImage', size='same2max'),
     dict(
