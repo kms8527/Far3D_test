@@ -26,6 +26,16 @@ import numpy as np
 import pycocotools.mask as mask_util
 from matplotlib import pyplot as plt
 
+
+def _is_av2_dataset(dataset):
+    return dataset is not None and dataset.__class__.__name__ in {'Argoverse2Dataset', 'Argoverse2DatasetT'}
+
+
+def _is_nuscenes_dataset(dataset):
+    if dataset is None:
+        return False
+    return 'nuscenes' in dataset.__class__.__name__.lower()
+
 def _to_visual_results(result):
     if isinstance(result, dict):
         if 'bbox_results' in result:
@@ -149,17 +159,26 @@ def _dataset_index_from_filenames(dataset, filenames):
     if filename2idx is None:
         filename2idx = {}
         for index, info in enumerate(getattr(dataset, 'data_infos', [])):
-            cams = info.get('cams', {})
+            cams = info.get('cams')
+            if cams is None:
+                cams = info.get('cam_infos', {})
             ordered = []
             for _, cam_info in sorted(cams.items()):
                 data_path = cam_info.get('data_path')
+                if data_path is None:
+                    data_path = cam_info.get('fpath')
                 if data_path is not None:
-                    ordered.append(osp.normpath(str(data_path)))
+                    data_path = str(data_path)
+                    ordered.append(osp.normpath(data_path))
+                    data_root = getattr(dataset, 'data_root', None)
+                    if data_root is not None:
+                        ordered.append(osp.normpath(str(osp.join(str(data_root), data_path))))
             if ordered:
-                filename2idx[tuple(ordered)] = index
+                filename2idx[tuple(sorted(set(ordered)))] = index
         dataset._vis_filename2idx = filename2idx
 
-    return filename2idx.get(key)
+    lookup_key = tuple(sorted(set(key)))
+    return filename2idx.get(lookup_key)
 
 
 def _to_numpy_labels(labels):
@@ -176,6 +195,224 @@ def _to_numpy_scores(scores):
     if isinstance(scores, torch.Tensor):
         return scores.detach().cpu().numpy()
     return np.asarray(scores)
+
+
+def _boxes3d_centers_numpy(boxes_3d):
+    if boxes_3d is None:
+        return np.empty((0, 3), dtype=np.float32)
+
+    centers = getattr(boxes_3d, 'gravity_center', None)
+    if centers is None:
+        tensor = getattr(boxes_3d, 'tensor', None)
+        if tensor is None:
+            return np.empty((0, 3), dtype=np.float32)
+        centers = tensor[:, :3]
+    if isinstance(centers, torch.Tensor):
+        centers = centers.detach().cpu().numpy()
+    else:
+        centers = np.asarray(centers)
+    return np.asarray(centers, dtype=np.float32)
+
+
+def _resolve_tp_match_threshold(dataset, default_threshold=2.0):
+    eval_cfg = getattr(dataset, 'eval_detection_configs', None)
+    if eval_cfg is None:
+        return float(default_threshold)
+    for attr in ('dist_th_tp', 'tp_threshold_m'):
+        value = getattr(eval_cfg, attr, None)
+        if value is not None:
+            return float(value)
+    return float(default_threshold)
+
+
+def _resolve_class_range_map(dataset):
+    eval_cfg = getattr(dataset, 'eval_detection_configs', None)
+    class_range = getattr(eval_cfg, 'class_range', None) if eval_cfg is not None else None
+    return class_range if isinstance(class_range, dict) else None
+
+
+def _labels_to_class_names(dataset, labels):
+    class_names = getattr(dataset, 'CLASSES', None)
+    names = []
+    for class_id in np.asarray(labels, dtype=np.int64):
+        if class_names is not None and 0 <= int(class_id) < len(class_names):
+            names.append(str(class_names[int(class_id)]))
+        else:
+            names.append(str(int(class_id)))
+    return np.asarray(names, dtype=object)
+
+
+def _resolve_eval_range(dataset):
+    eval_range = getattr(dataset, 'eval_range_m', None)
+    if eval_range is None:
+        eval_cfg = getattr(dataset, 'eval_detection_configs', None)
+        eval_range = getattr(eval_cfg, 'eval_range_m', None) if eval_cfg is not None else None
+    if eval_range is None:
+        return 0.0, 150.0
+    eval_range = list(eval_range)
+    if len(eval_range) < 2:
+        return 0.0, 150.0
+    return float(eval_range[0]), float(eval_range[1])
+
+
+def _compute_range_mask(centers, eval_range):
+    if centers.size == 0:
+        return np.zeros((0,), dtype=bool)
+    norms = np.linalg.norm(centers[:, :3], axis=1)
+    return np.logical_and(norms > eval_range[0], norms < eval_range[1])
+
+
+def _compute_nuscenes_eval_mask(centers, labels, dataset):
+    if centers.size == 0:
+        return np.zeros((0,), dtype=bool)
+
+    class_range = _resolve_class_range_map(dataset)
+    if not class_range:
+        return np.ones((centers.shape[0],), dtype=bool)
+
+    class_names = _labels_to_class_names(dataset, labels)
+    distances = np.linalg.norm(centers[:, :2], axis=1)
+    mask = np.zeros((centers.shape[0],), dtype=bool)
+    for idx, class_name in enumerate(class_names):
+        max_range = class_range.get(class_name)
+        if max_range is None:
+            max_range = class_range.get(class_name.lower())
+        if max_range is None:
+            max_range = class_range.get(class_name.upper())
+        if max_range is None:
+            continue
+        mask[idx] = distances[idx] < float(max_range)
+    return mask
+
+
+def _build_av2_fail_proxy(pred_boxes_3d, pred_labels, pred_scores, gt_boxes_3d, gt_labels, dataset=None, tp_threshold_m=2.0):
+    pred_labels = np.asarray(pred_labels if pred_labels is not None else [], dtype=np.int64)
+    pred_scores = np.asarray(pred_scores if pred_scores is not None else [], dtype=np.float32)
+    gt_labels = np.asarray(gt_labels if gt_labels is not None else [], dtype=np.int64)
+
+    pred_centers = _boxes3d_centers_numpy(pred_boxes_3d)
+    gt_centers = _boxes3d_centers_numpy(gt_boxes_3d)
+    eval_range = _resolve_eval_range(dataset)
+    pred_eval_mask = _compute_range_mask(pred_centers, eval_range)
+    gt_eval_mask = _compute_range_mask(gt_centers, eval_range)
+
+    if pred_scores.shape[0] != pred_labels.shape[0]:
+        pred_scores = np.ones((pred_labels.shape[0],), dtype=np.float32)
+
+    pred_keep_mask = pred_eval_mask.copy()
+    if pred_keep_mask.size > 0:
+        for class_id in np.unique(pred_labels):
+            class_indices = np.where(np.logical_and(pred_keep_mask, pred_labels == class_id))[0]
+            if class_indices.size <= 100:
+                continue
+            ranked = class_indices[np.argsort(-pred_scores[class_indices])]
+            pred_keep_mask[ranked[100:]] = False
+
+    unmatched_gt_mask = gt_eval_mask.copy()
+    false_positive_mask = pred_keep_mask.copy()
+
+    if pred_centers.shape[0] > 0 and gt_centers.shape[0] > 0:
+        candidate_classes = np.union1d(np.unique(pred_labels), np.unique(gt_labels))
+        for class_id in candidate_classes:
+            pred_indices = np.where(np.logical_and(pred_keep_mask, pred_labels == class_id))[0]
+            gt_indices = np.where(np.logical_and(gt_eval_mask, gt_labels == class_id))[0]
+            if pred_indices.size == 0 or gt_indices.size == 0:
+                continue
+
+            pred_indices = pred_indices[np.argsort(-pred_scores[pred_indices])]
+            remaining_gt = set(int(index) for index in gt_indices.tolist())
+            for pred_index in pred_indices:
+                if not remaining_gt:
+                    break
+                remaining_gt_list = np.asarray(sorted(remaining_gt), dtype=np.int64)
+                distances = np.linalg.norm(
+                    gt_centers[remaining_gt_list] - pred_centers[pred_index][None, :], axis=1)
+                best_local = int(np.argmin(distances))
+                if distances[best_local] > tp_threshold_m:
+                    continue
+                matched_gt = int(remaining_gt_list[best_local])
+                false_positive_mask[pred_index] = False
+                unmatched_gt_mask[matched_gt] = False
+                remaining_gt.remove(matched_gt)
+
+    fail_frame = bool(false_positive_mask.any() or unmatched_gt_mask.any())
+    return {
+        'fail_frame': fail_frame,
+        'unmatched_gt_mask': unmatched_gt_mask,
+        'false_positive_mask': false_positive_mask,
+        'pred_eval_mask': pred_keep_mask,
+        'gt_eval_mask': gt_eval_mask,
+    }
+
+
+def _build_nuscenes_fail_proxy(pred_boxes_3d, pred_labels, pred_scores, gt_boxes_3d, gt_labels, dataset=None):
+    pred_labels = np.asarray(pred_labels if pred_labels is not None else [], dtype=np.int64)
+    pred_scores = np.asarray(pred_scores if pred_scores is not None else [], dtype=np.float32)
+    gt_labels = np.asarray(gt_labels if gt_labels is not None else [], dtype=np.int64)
+
+    pred_centers = _boxes3d_centers_numpy(pred_boxes_3d)
+    gt_centers = _boxes3d_centers_numpy(gt_boxes_3d)
+    pred_eval_mask = _compute_nuscenes_eval_mask(pred_centers, pred_labels, dataset)
+    gt_eval_mask = _compute_nuscenes_eval_mask(gt_centers, gt_labels, dataset)
+    tp_threshold_m = _resolve_tp_match_threshold(dataset, default_threshold=2.0)
+
+    if pred_scores.shape[0] != pred_labels.shape[0]:
+        pred_scores = np.ones((pred_labels.shape[0],), dtype=np.float32)
+
+    unmatched_gt_mask = gt_eval_mask.copy()
+    false_positive_mask = pred_eval_mask.copy()
+    candidate_classes = np.union1d(np.unique(pred_labels), np.unique(gt_labels))
+    for class_id in candidate_classes:
+        pred_indices = np.where(np.logical_and(pred_eval_mask, pred_labels == class_id))[0]
+        gt_indices = np.where(np.logical_and(gt_eval_mask, gt_labels == class_id))[0]
+        if pred_indices.size == 0:
+            continue
+
+        pred_indices = pred_indices[np.argsort(-pred_scores[pred_indices])]
+        remaining_gt = set(int(index) for index in gt_indices.tolist())
+        for pred_index in pred_indices:
+            match_gt = None
+            min_dist = np.inf
+            for gt_index in remaining_gt:
+                this_distance = np.linalg.norm(pred_centers[pred_index, :2] - gt_centers[gt_index, :2])
+                if this_distance < min_dist:
+                    min_dist = this_distance
+                    match_gt = gt_index
+
+            if match_gt is not None and min_dist < tp_threshold_m:
+                false_positive_mask[pred_index] = False
+                unmatched_gt_mask[match_gt] = False
+                remaining_gt.remove(match_gt)
+
+    fail_frame = bool(false_positive_mask.any() or unmatched_gt_mask.any())
+    return {
+        'fail_frame': fail_frame,
+        'unmatched_gt_mask': unmatched_gt_mask,
+        'false_positive_mask': false_positive_mask,
+        'pred_eval_mask': pred_eval_mask,
+        'gt_eval_mask': gt_eval_mask,
+    }
+
+
+def _build_metric_fail_proxy(pred_boxes_3d, pred_labels, pred_scores, gt_boxes_3d, gt_labels, dataset=None):
+    if _is_nuscenes_dataset(dataset):
+        return _build_nuscenes_fail_proxy(
+            pred_boxes_3d=pred_boxes_3d,
+            pred_labels=pred_labels,
+            pred_scores=pred_scores,
+            gt_boxes_3d=gt_boxes_3d,
+            gt_labels=gt_labels,
+            dataset=dataset,
+        )
+    return _build_av2_fail_proxy(
+        pred_boxes_3d=pred_boxes_3d,
+        pred_labels=pred_labels,
+        pred_scores=pred_scores,
+        gt_boxes_3d=gt_boxes_3d,
+        gt_labels=gt_labels,
+        dataset=dataset,
+        tp_threshold_m=_resolve_tp_match_threshold(dataset, default_threshold=2.0),
+    )
 
 
 def _project_boxes_to_views(boxes_3d, lidar2img):
@@ -318,7 +555,7 @@ def _shift_projected_boxes(boxes_2d, offset_x, offset_y):
     return shifted
 
 
-def _draw_projected_boxes(canvas, boxes_2d, labels, edges, class_names=None, scores=None, gt=False):
+def _draw_projected_boxes(canvas, boxes_2d, labels, edges, class_names=None, scores=None, gt=False, box_colors=None):
     if boxes_2d is None or labels is None or len(labels) == 0:
         return {}
 
@@ -326,7 +563,10 @@ def _draw_projected_boxes(canvas, boxes_2d, labels, edges, class_names=None, sco
     for box_idx, box in enumerate(boxes_2d):
         class_id = int(labels[box_idx])
         cls_name = _class_name(class_names, class_id)
-        color = (255, 255, 255) if gt else _class_color(class_id)
+        if box_colors is not None and box_idx < len(box_colors) and box_colors[box_idx] is not None:
+            color = tuple(int(channel) for channel in box_colors[box_idx])
+        else:
+            color = (255, 255, 255) if gt else _class_color(class_id)
         visible_classes[(gt, class_id)] = (cls_name, color)
         visible = []
         for start, end in edges:
@@ -355,6 +595,10 @@ def _draw_projected_boxes(canvas, boxes_2d, labels, edges, class_names=None, sco
 
 
 def _load_gt_annotations(dataset, sample_meta):
+    dataset_index = sample_meta.get('_dataset_index')
+    if dataset_index is not None:
+        return _load_gt_annotations_by_index(dataset, int(dataset_index))
+
     sample_token = _sample_token_from_meta(sample_meta)
     dataset_index = _dataset_index_from_token(dataset, sample_token)
     if dataset_index is None:
@@ -362,11 +606,7 @@ def _load_gt_annotations(dataset, sample_meta):
     if dataset_index is None:
         return None, None
 
-    ann_info = dataset.get_ann_info(dataset_index)
-    if not isinstance(ann_info, dict):
-        return None, None
-
-    return ann_info.get('gt_bboxes_3d'), _to_numpy_labels(ann_info.get('gt_labels_3d'))
+    return _load_gt_annotations_by_index(dataset, dataset_index)
 
 
 def _load_gt_annotations_by_index(dataset, dataset_index):
@@ -375,11 +615,40 @@ def _load_gt_annotations_by_index(dataset, dataset_index):
     if dataset_index < 0 or dataset_index >= len(getattr(dataset, 'data_infos', [])):
         return None, None
 
-    ann_info = dataset.get_ann_info(dataset_index)
-    if not isinstance(ann_info, dict):
+    ann_info = None
+    try:
+        ann_info = dataset.get_ann_info(dataset_index)
+    except TypeError:
+        pass
+
+    if isinstance(ann_info, dict):
+        return ann_info.get('gt_bboxes_3d'), _to_numpy_labels(ann_info.get('gt_labels_3d'))
+
+    if not _is_av2_dataset(dataset):
         return None, None
 
-    return ann_info.get('gt_bboxes_3d'), _to_numpy_labels(ann_info.get('gt_labels_3d'))
+    info = getattr(dataset, 'data_infos', [])[dataset_index].get('gt3d_infos')
+    if not isinstance(info, dict):
+        return None, None
+
+    if getattr(dataset, 'use_valid_flag', False):
+        mask = info['valid_flag']
+    else:
+        mask = info['num_interior_pts'] > 0
+    gt_bboxes_3d = info['gt_boxes'][mask]
+    gt_names_3d = np.array(info['gt_names'])[mask]
+    gt_labels_3d = []
+    for cat in gt_names_3d:
+        if cat in dataset.CLASSES:
+            gt_labels_3d.append(dataset.CLASSES.index(cat))
+        else:
+            gt_labels_3d.append(-1)
+    gt_labels_3d = np.array(gt_labels_3d, dtype=np.int64)
+    gt_bboxes_3d = dataset.box_type_3d(
+        gt_bboxes_3d,
+        box_dim=gt_bboxes_3d.shape[-1],
+        origin=(0.5, 0.5, 0.5)).convert_to(dataset.box_mode_3d)
+    return gt_bboxes_3d, gt_labels_3d
 
 
 def _save_projected_3d_boxes(data, vis_result, show_dir, rank, class_names=None, dataset=None, show_gt=False, dataset_start_index=None):
@@ -414,6 +683,9 @@ def _save_projected_3d_boxes(data, vis_result, show_dir, rank, class_names=None,
     sample_count = min(len(vis_result), len(batch_imgs), len(img_metas))
     for sample_idx in range(sample_count):
         sample_meta = img_metas[sample_idx]
+        if dataset_start_index is not None:
+            sample_meta = dict(sample_meta)
+            sample_meta['_dataset_index'] = dataset_start_index + sample_idx
         sample_result = vis_result[sample_idx]
         if not isinstance(sample_result, dict) or 'pts_bbox' not in sample_result:
             continue
@@ -464,12 +736,32 @@ def _save_projected_3d_boxes(data, vis_result, show_dir, rank, class_names=None,
             continue
 
         pred_boxes_2d = _project_boxes_to_views(pred_boxes_3d, lidar2img)
-        gt_boxes_3d, gt_labels = _load_gt_annotations(dataset, sample_meta) if show_gt else (None, None)
-        if show_gt and gt_boxes_3d is None and dataset_start_index is not None:
+        gt_boxes_3d, gt_labels = _load_gt_annotations(dataset, sample_meta)
+        if gt_boxes_3d is None and dataset_start_index is not None:
             gt_boxes_3d, gt_labels = _load_gt_annotations_by_index(dataset, dataset_start_index + sample_idx)
         gt_boxes_2d = _project_boxes_to_views(gt_boxes_3d, lidar2img) if gt_boxes_3d is not None else None
         if (pred_boxes_2d is None or len(pred_boxes_2d) == 0) and (gt_boxes_2d is None or len(gt_boxes_2d) == 0):
             continue
+
+        fail_proxy = None
+        gt_box_colors = None
+        if gt_boxes_3d is not None and gt_labels is not None:
+            fail_proxy = _build_metric_fail_proxy(
+                pred_boxes_3d=pred_boxes_3d,
+                pred_labels=labels,
+                pred_scores=scores,
+                gt_boxes_3d=gt_boxes_3d,
+                gt_labels=gt_labels,
+                dataset=dataset,
+            )
+            gt_box_colors = []
+            unmatched_gt_mask = fail_proxy['unmatched_gt_mask']
+            gt_eval_mask = fail_proxy['gt_eval_mask']
+            for gt_idx in range(len(gt_labels)):
+                if gt_eval_mask[gt_idx] and unmatched_gt_mask[gt_idx]:
+                    gt_box_colors.append((0, 0, 255))
+                else:
+                    gt_box_colors.append((255, 255, 255))
 
         sample_name = str(sample_meta.get('sample_idx') or sample_meta.get('scene_token') or sample_meta.get('lidar_timestamp') or sample_idx)
         filenames = sample_meta.get('filename')
@@ -505,11 +797,12 @@ def _save_projected_3d_boxes(data, vis_result, show_dir, rank, class_names=None,
             )
             gt_visible = _draw_projected_boxes(
                 canvas,
-                gt_view_boxes,
-                gt_labels,
+                gt_view_boxes if show_gt else None,
+                gt_labels if show_gt else None,
                 edges,
                 class_names=class_names,
                 gt=True,
+                box_colors=gt_box_colors if show_gt else None,
             )
             visible_classes.update(pred_visible)
             visible_classes.update(gt_visible)
@@ -524,7 +817,12 @@ def _save_projected_3d_boxes(data, vis_result, show_dir, rank, class_names=None,
                 out_name = f'{sample_name}_view{view_idx}_3dbox.jpg'
             camera_dir = osp.join(rank_dir, camera_name)
             mmcv.mkdir_or_exist(camera_dir)
-            mmcv.imwrite(canvas, osp.join(camera_dir, out_name))
+            image_path = osp.join(camera_dir, out_name)
+            mmcv.imwrite(canvas, image_path)
+            if fail_proxy is not None and fail_proxy['fail_frame']:
+                fail_camera_dir = osp.join(rank_dir, 'fail_pred', camera_name)
+                mmcv.mkdir_or_exist(fail_camera_dir)
+                mmcv.imwrite(canvas, osp.join(fail_camera_dir, out_name))
 
     return True
 

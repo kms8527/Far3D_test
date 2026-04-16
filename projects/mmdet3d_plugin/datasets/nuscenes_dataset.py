@@ -255,6 +255,44 @@ class CustomNuScenesDataset(NuScenesDataset):
                 continue
             return data
 
+    def evaluate(self,
+                 results,
+                 metric='bbox',
+                 logger=None,
+                 jsonfile_prefix=None,
+                 result_names=['pts_bbox'],
+                 show=False,
+                 out_dir=None,
+                 pipeline=None):
+        results_dict = super().evaluate(
+            results,
+            metric=metric,
+            logger=logger,
+            jsonfile_prefix=jsonfile_prefix,
+            result_names=result_names,
+            show=show,
+            out_dir=out_dir,
+            pipeline=pipeline)
+
+        metric_prefixes = []
+        if isinstance(result_names, (list, tuple)):
+            metric_prefixes.extend([f'{name}_NuScenes' for name in result_names])
+        metric_prefixes.extend(['pts_bbox_NuScenes', 'img_bbox_NuScenes'])
+
+        headline_metric_names = ('mAP', 'mATE', 'mASE', 'mAOE', 'mAVE', 'mAAE', 'NDS')
+        for metric_prefix in metric_prefixes:
+            has_prefixed_metrics = False
+            for metric_name in headline_metric_names:
+                prefixed_key = f'{metric_prefix}/{metric_name}'
+                if prefixed_key not in results_dict or metric_name in results_dict:
+                    continue
+                results_dict[metric_name] = results_dict[prefixed_key]
+                has_prefixed_metrics = True
+            if has_prefixed_metrics:
+                break
+
+        return results_dict
+
 def invert_matrix_egopose_numpy(egopose):
     """ Compute the inverse transformation of a 4x4 egopose numpy matrix."""
     inverse_matrix = np.zeros((4, 4), dtype=np.float32)
