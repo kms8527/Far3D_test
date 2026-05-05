@@ -513,6 +513,7 @@ class DeformableFeatureAggregationCuda(BaseModule):
         self.drop = nn.Dropout(dropout)
         self.im2col_step = im2col_step
         self.bias = bias
+        self.debug_last_sampling = None
 
     def init_weight(self):
         constant_init(self.weights_fc, val=0.0, bias=0.0)
@@ -527,6 +528,17 @@ class DeformableFeatureAggregationCuda(BaseModule):
         weights = self._get_weights(instance_feature, query_pos, lidar2img_mat) # [N, ]
 
         features = self.feature_sampling(feat_flatten, spatial_flatten, level_start_index, key_points, weights, lidar2img_mat, img_metas) # [B, pad_size + num_query + num_propagated, C]
+
+        weights_debug = weights.reshape(bs, self.num_cams, num_anchor, self.num_groups, self.num_levels * key_points.shape[2])
+        self.debug_last_sampling = {
+            'reference_points': reference_points.detach().cpu(),
+            'key_points': key_points.detach().cpu(),
+            'weights': weights_debug.detach().cpu(),
+            'num_levels': self.num_levels,
+            'num_groups': self.num_groups,
+            'num_pts': key_points.shape[2],
+            'num_cams': self.num_cams,
+        }
 
         output = self.output_proj(features)
         output = self.drop(output) + instance_feature
@@ -550,6 +562,9 @@ class DeformableFeatureAggregationCuda(BaseModule):
         points_2d = points_2d[..., :2] / torch.clamp(points_2d[..., 2:3], min=1e-5)
         points_2d[..., 0:1] = points_2d[..., 0:1] / img_metas[0]['pad_shape'][0][1]
         points_2d[..., 1:2] = points_2d[..., 1:2] / img_metas[0]['pad_shape'][0][0]
+
+        if self.debug_last_sampling is not None:
+            self.debug_last_sampling['points_2d'] = points_2d.detach().cpu()
 
         points_2d = points_2d.flatten(end_dim=1) #[b*N, query, key_points, 2(x,y)]
         points_2d = points_2d[:, :, None, None, :, :].repeat(1, 1, self.num_groups, self.num_levels, 1, 1)

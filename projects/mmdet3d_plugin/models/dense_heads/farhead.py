@@ -506,6 +506,7 @@ class FarHead(AnchorFreeHead):
         self.memory_yaw_rate = None
         self.memory_label = None
         self.debug_last_vehicle_kinematics = None
+        self.debug_last_decoder_outputs = None
 
     def _wrap_angle(self, angle):
         return torch.atan2(torch.sin(angle), torch.cos(angle))
@@ -947,6 +948,11 @@ class FarHead(AnchorFreeHead):
         all_cls_scores = torch.stack(outputs_classes)
         all_bbox_preds = torch.stack(outputs_coords)
         all_bbox_preds[..., 0:3] = (all_bbox_preds[..., 0:3] * (self.pc_range[3:6] - self.pc_range[0:3]) + self.pc_range[0:3])
+        self.debug_last_decoder_outputs = {
+            'all_cls_scores': all_cls_scores.detach().cpu(),
+            'all_bbox_preds': all_bbox_preds.detach().cpu(),
+            'reference_points': reference_points.detach().cpu(),
+        }
         
         # update the memory bank
         self.post_update_memory(data, rec_ego_pose, all_cls_scores, all_bbox_preds, outs_dec, mask_dict)

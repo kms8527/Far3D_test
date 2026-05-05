@@ -157,6 +157,7 @@ class YOLOXHeadCustom(BaseDenseHead, BBoxTestMixin):
         self.multi_level_pred = ('multi_level_pred' in self.depthnet_config) and self.depthnet_config['multi_level_pred']
         self.return_context_feat = return_context_feat
         self.embedding_cam = embedding_cam
+        self.debug_last_test_outputs = None
 
         self.fp16_enabled = False
         self._init_layers()
@@ -448,18 +449,35 @@ class YOLOXHeadCustom(BaseDenseHead, BBoxTestMixin):
         flatten_objectness = torch.cat(flatten_objectness, dim=1).sigmoid()     # (BN, sum(Hi*Wi))
         flatten_priors = torch.cat(mlvl_priors)     # (sum(Hi*Wi), 4)
         flatten_bboxes = self._bbox_decode(flatten_priors, flatten_bbox_preds)  # (BN, sum(Hi*Wi), 4)
+        max_cls_scores, pred_labels = flatten_cls_scores.max(dim=-1)
 
         # if rescale:
         #     flatten_bboxes[..., :4] /= flatten_bboxes.new_tensor(
         #         scale_factors).unsqueeze(1)
         result_list = []
+        debug_bbox_list = []
+        debug_score_list = []
+        debug_label_list = []
+        debug_obj_list = []
         for i in range(num_imgs):
             if self.sample_with_score:
-                pred_bbox = flatten_bboxes[i][valid_indices[i].repeat(1, 4)].reshape(-1, 4)     # (M, 4)
+                valid_mask = valid_indices[i].squeeze(-1)
+                pred_bbox = flatten_bboxes[i][valid_mask]     # (M, 4)
+                pred_score = (max_cls_scores[i] * flatten_objectness[i])[valid_mask]
+                pred_label = pred_labels[i][valid_mask]
+                pred_obj = flatten_objectness[i][valid_mask]
             else:
                 pred_bbox = torch.gather(flatten_bboxes[i], 0, topk_indexes[i].repeat(1, 4))
+                gather_index = topk_indexes[i].squeeze(-1)
+                pred_score = (max_cls_scores[i] * flatten_objectness[i])[gather_index]
+                pred_label = pred_labels[i][gather_index]
+                pred_obj = flatten_objectness[i][gather_index]
             bbox = bbox_xyxy_to_cxcywh(pred_bbox)
             result_list.append(bbox)
+            debug_bbox_list.append(pred_bbox.detach().cpu())
+            debug_score_list.append(pred_score.detach().cpu())
+            debug_label_list.append(pred_label.detach().cpu())
+            debug_obj_list.append(pred_obj.detach().cpu())
         # for i in range(7):
         #     # print(len(img_metas))
         #     bbox = img_metas[0]['offline_2d'][i]
@@ -488,6 +506,20 @@ class YOLOXHeadCustom(BaseDenseHead, BBoxTestMixin):
                     valid_depth = pred_depths[ith][valid_indices[ith]].reshape(-1, 1).detach()
                     valid_depth_list.append(valid_depth)   # BN x (Mi, 1)
                 outs['valid_depth_list'] = valid_depth_list
+
+        debug_outputs = {
+            'bbox_list': debug_bbox_list,
+            'scores': debug_score_list,
+            'labels': debug_label_list,
+            'objectness': debug_obj_list,
+            'depthnet_config': dict(self.depthnet_config),
+            'multi_level_pred': self.multi_level_pred,
+            'reg_depth_level': self.reg_depth_level,
+        }
+        for key in ('pred_depth', 'depth_logit', 'pred_depth_var'):
+            if key in preds_dicts and isinstance(preds_dicts[key], torch.Tensor):
+                debug_outputs[key] = preds_dicts[key].detach().cpu()
+        self.debug_last_test_outputs = debug_outputs
 
         # return result_list
         return outs

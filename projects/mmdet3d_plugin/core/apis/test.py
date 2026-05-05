@@ -197,6 +197,247 @@ def _to_numpy_scores(scores):
     return np.asarray(scores)
 
 
+def _project_points_to_image(points_3d, lidar2img):
+    points_3d = np.asarray(points_3d, dtype=np.float32)
+    if points_3d.size == 0:
+        return np.empty((0, 3), dtype=np.float32)
+    pts_h = np.concatenate([points_3d, np.ones((points_3d.shape[0], 1), dtype=np.float32)], axis=1)
+    proj = pts_h @ np.asarray(lidar2img, dtype=np.float32).T
+    proj[:, :2] /= np.clip(proj[:, 2:3], 1e-5, None)
+    return proj[:, :3]
+
+
+def _depth_bin_values_from_cfg(depthnet_config, depth_channels):
+    depth_min = float(depthnet_config.get('depth_min', 1e-1))
+    depth_max = float(depthnet_config.get('depth_max', max(depth_min + 1.0, 110.0)))
+    num_bins = max(int(depth_channels) - 1, 1)
+    if depth_max <= depth_min:
+        return np.linspace(depth_min, depth_min + float(depth_channels) - 1.0, int(depth_channels), dtype=np.float32)
+    bin_size = 2 * (depth_max - depth_min) / (num_bins * (1 + num_bins))
+    bin_indices = np.arange(num_bins, dtype=np.float32)
+    bin_values = (bin_indices + 0.5) ** 2 * bin_size / 2 - bin_size / 8 + depth_min
+    bin_values = np.concatenate([bin_values, np.array([depth_max], dtype=np.float32)], axis=0)
+    if bin_values.shape[0] != int(depth_channels):
+        bin_values = np.linspace(depth_min, depth_max, int(depth_channels), dtype=np.float32)
+    return bin_values.astype(np.float32)
+
+
+def _colorize_map(values, vmin=None, vmax=None, colormap=cv2.COLORMAP_TURBO):
+    values = np.asarray(values, dtype=np.float32)
+    finite = np.isfinite(values)
+    if not finite.any():
+        return np.zeros(values.shape + (3,), dtype=np.uint8)
+    if vmin is None:
+        vmin = float(np.nanmin(values[finite]))
+    if vmax is None:
+        vmax = float(np.nanmax(values[finite]))
+    if not np.isfinite(vmin):
+        vmin = 0.0
+    if not np.isfinite(vmax) or vmax <= vmin:
+        vmax = vmin + 1.0
+    normalized = np.clip((values - vmin) / (vmax - vmin), 0.0, 1.0)
+    colored = cv2.applyColorMap((normalized * 255).astype(np.uint8), colormap)
+    colored[~finite] = 0
+    return colored
+
+
+def _save_depth_and_yolo_debug(model, data, show_dir, rank, class_names=None):
+    if show_dir is None:
+        return False
+    module = model.module if hasattr(model, 'module') else model
+    roi_head = getattr(module, 'img_roi_head', None)
+    debug_info = getattr(roi_head, 'debug_last_test_outputs', None)
+    if not isinstance(debug_info, dict):
+        return False
+
+    img_raw = _unwrap_batch_item(data.get('img'))
+    img_metas_raw = _unwrap_batch_item(data.get('img_metas'))
+    if img_raw is None or img_metas_raw is None or not isinstance(img_raw, torch.Tensor):
+        return False
+
+    img_metas = [img_metas_raw] if isinstance(img_metas_raw, dict) else list(img_metas_raw)
+    if img_raw.dim() == 5:
+        batch_imgs = [img_raw[idx] for idx in range(img_raw.shape[0])]
+    elif img_raw.dim() == 4:
+        batch_imgs = [img_raw]
+    else:
+        return False
+
+    bbox_list = debug_info.get('bbox_list', [])
+    score_list = debug_info.get('scores', [])
+    label_list = debug_info.get('labels', [])
+    objectness_list = debug_info.get('objectness', [])
+    pred_depth = debug_info.get('pred_depth')
+    depth_bin_values = None
+    if isinstance(pred_depth, torch.Tensor) and pred_depth.dim() == 4:
+        depth_bin_values = _depth_bin_values_from_cfg(debug_info.get('depthnet_config', {}), pred_depth.shape[1])
+
+    rank_dir = osp.join(show_dir, f'rank_{rank}')
+    yolo_dir = osp.join(rank_dir, 'yolo_debug')
+    depth_dir = osp.join(rank_dir, 'depth_debug')
+    mmcv.mkdir_or_exist(yolo_dir)
+    mmcv.mkdir_or_exist(depth_dir)
+
+    saved = False
+    for sample_idx, (img_tensor, sample_meta) in enumerate(zip(batch_imgs, img_metas)):
+        if img_tensor.dim() != 4:
+            continue
+        if isinstance(sample_meta.get('img_norm_cfg'), dict):
+            view_images = tensor2imgs(img_tensor, **sample_meta['img_norm_cfg'])
+        else:
+            view_images = [_to_numpy_image(view) for view in img_tensor]
+        sample_name = str(sample_meta.get('sample_idx') or sample_meta.get('scene_token') or sample_meta.get('lidar_timestamp') or sample_idx)
+        filenames = sample_meta.get('filename')
+        num_views = len(view_images)
+        for view_idx, view_img in enumerate(view_images):
+            flat_idx = sample_idx * num_views + view_idx
+            camera_name = _camera_name_from_filename(filenames[view_idx], view_idx) if isinstance(filenames, (list, tuple)) and view_idx < len(filenames) else f'camera_{view_idx}'
+            stem = osp.splitext(osp.basename(filenames[view_idx]))[0] if isinstance(filenames, (list, tuple)) and view_idx < len(filenames) else f'view{view_idx}'
+
+            yolo_canvas = view_img.copy()
+            boxes = bbox_list[flat_idx].numpy() if flat_idx < len(bbox_list) else np.empty((0, 4), dtype=np.float32)
+            scores = score_list[flat_idx].numpy() if flat_idx < len(score_list) else np.empty((0,), dtype=np.float32)
+            labels = label_list[flat_idx].numpy() if flat_idx < len(label_list) else np.empty((0,), dtype=np.int64)
+            objs = objectness_list[flat_idx].numpy() if flat_idx < len(objectness_list) else np.empty((0,), dtype=np.float32)
+            for det_idx, box in enumerate(boxes):
+                class_id = int(labels[det_idx]) if det_idx < len(labels) else 0
+                color = _class_color(class_id)
+                x1, y1, x2, y2 = [int(round(v)) for v in box.tolist()]
+                cv2.rectangle(yolo_canvas, (x1, y1), (x2, y2), color, 2)
+                score = float(scores[det_idx]) if det_idx < len(scores) else 0.0
+                obj = float(objs[det_idx]) if det_idx < len(objs) else 0.0
+                _draw_text_with_outline(yolo_canvas, f'{_class_name(class_names, class_id)} s={score:.2f} o={obj:.2f}', (x1, max(15, y1 - 4)), color)
+            camera_yolo_dir = osp.join(yolo_dir, camera_name)
+            mmcv.mkdir_or_exist(camera_yolo_dir)
+            mmcv.imwrite(yolo_canvas, osp.join(camera_yolo_dir, f'{sample_name}_{stem}_yolo.jpg'))
+            np.savez_compressed(osp.join(camera_yolo_dir, f'{sample_name}_{stem}_yolo.npz'), boxes=boxes, scores=scores, labels=labels, objectness=objs)
+            saved = True
+
+            if depth_bin_values is None or not isinstance(pred_depth, torch.Tensor) or flat_idx >= pred_depth.shape[0]:
+                continue
+            prob_volume = pred_depth[flat_idx].numpy()
+            expected_depth = (prob_volume * depth_bin_values[:, None, None]).sum(axis=0)
+            hard_depth = depth_bin_values[np.argmax(prob_volume, axis=0)]
+            expected_depth = cv2.resize(expected_depth, (view_img.shape[1], view_img.shape[0]), interpolation=cv2.INTER_LINEAR)
+            hard_depth = cv2.resize(hard_depth, (view_img.shape[1], view_img.shape[0]), interpolation=cv2.INTER_NEAREST)
+            heatmap = _colorize_map(expected_depth, vmin=depth_bin_values.min(), vmax=depth_bin_values.max())
+            overlay = cv2.addWeighted(view_img, 0.55, heatmap, 0.45, 0.0)
+            camera_depth_dir = osp.join(depth_dir, camera_name)
+            mmcv.mkdir_or_exist(camera_depth_dir)
+            mmcv.imwrite(heatmap, osp.join(camera_depth_dir, f'{sample_name}_{stem}_depth_heatmap.jpg'))
+            mmcv.imwrite(overlay, osp.join(camera_depth_dir, f'{sample_name}_{stem}_depth_overlay.jpg'))
+            np.savez_compressed(osp.join(camera_depth_dir, f'{sample_name}_{stem}_depth.npz'), expected_depth=expected_depth.astype(np.float32), hard_depth=hard_depth.astype(np.float32), depth_bin_values=depth_bin_values.astype(np.float32))
+    return saved
+
+
+def _save_deformable_attention_debug(model, data, show_dir, rank, class_names=None, topk_queries=5):
+    if show_dir is None:
+        return False
+    module = model.module if hasattr(model, 'module') else model
+    pts_bbox_head = getattr(module, 'pts_bbox_head', None)
+    decoder_debug = getattr(pts_bbox_head, 'debug_last_decoder_outputs', None)
+    transformer = getattr(pts_bbox_head, 'transformer', None)
+    decoder = getattr(transformer, 'decoder', None)
+    layers = getattr(decoder, 'layers', None)
+    if not isinstance(decoder_debug, dict) or layers is None:
+        return False
+
+    last_sampling = None
+    layer_index = None
+    for lid, layer in enumerate(layers):
+        for attention in getattr(layer, 'attentions', []):
+            debug_sampling = getattr(attention, 'debug_last_sampling', None)
+            if isinstance(debug_sampling, dict):
+                last_sampling = debug_sampling
+                layer_index = lid
+    if last_sampling is None or 'points_2d' not in last_sampling:
+        return False
+
+    img_raw = _unwrap_batch_item(data.get('img'))
+    img_metas_raw = _unwrap_batch_item(data.get('img_metas'))
+    if img_raw is None or img_metas_raw is None or not isinstance(img_raw, torch.Tensor):
+        return False
+    img_metas = [img_metas_raw] if isinstance(img_metas_raw, dict) else list(img_metas_raw)
+    if img_raw.dim() == 5:
+        batch_imgs = [img_raw[idx] for idx in range(img_raw.shape[0])]
+    elif img_raw.dim() == 4:
+        batch_imgs = [img_raw]
+    else:
+        return False
+
+    all_cls_scores = decoder_debug['all_cls_scores']
+    query_scores = all_cls_scores[-1].sigmoid().max(dim=-1)
+    query_score_values = query_scores.values.numpy()
+    query_labels = query_scores.indices.numpy()
+    reference_points = last_sampling['reference_points'].numpy()
+    key_points = last_sampling['key_points'].numpy()
+    points_2d = last_sampling['points_2d'].numpy()
+    weights = last_sampling['weights'].numpy()
+    num_levels = int(last_sampling['num_levels'])
+    num_pts = int(last_sampling['num_pts'])
+    weights = weights.mean(axis=3).reshape(weights.shape[0], weights.shape[1], weights.shape[2], num_levels, num_pts)
+    palette = [(255, 99, 71), (60, 179, 113), (30, 144, 255), (255, 215, 0), (186, 85, 211), (255, 140, 0)]
+
+    rank_dir = osp.join(show_dir, f'rank_{rank}', 'deformable_attention_debug')
+    mmcv.mkdir_or_exist(rank_dir)
+    saved = False
+    sample_count = min(len(batch_imgs), len(img_metas), reference_points.shape[0])
+    for sample_idx in range(sample_count):
+        img_tensor = batch_imgs[sample_idx]
+        sample_meta = img_metas[sample_idx]
+        if img_tensor.dim() != 4:
+            continue
+        if isinstance(sample_meta.get('img_norm_cfg'), dict):
+            view_images = tensor2imgs(img_tensor, **sample_meta['img_norm_cfg'])
+        else:
+            view_images = [_to_numpy_image(view) for view in img_tensor]
+        lidar2img = np.asarray(sample_meta.get('lidar2img'))
+        if lidar2img.ndim != 3:
+            continue
+        sample_name = str(sample_meta.get('sample_idx') or sample_meta.get('scene_token') or sample_meta.get('lidar_timestamp') or sample_idx)
+        filenames = sample_meta.get('filename')
+        topk = min(int(topk_queries), query_score_values.shape[1])
+        top_query_indices = np.argsort(-query_score_values[sample_idx])[:topk]
+        sample_dir = osp.join(rank_dir, sample_name)
+        mmcv.mkdir_or_exist(sample_dir)
+        for rank_idx, query_idx in enumerate(top_query_indices.tolist()):
+            query_dir = osp.join(sample_dir, f'layer{layer_index}_query{rank_idx:02d}_{query_idx:04d}')
+            mmcv.mkdir_or_exist(query_dir)
+            np.savez_compressed(osp.join(query_dir, 'sampling_points.npz'), reference_point=reference_points[sample_idx, query_idx], key_points=key_points[sample_idx, query_idx], points_2d=points_2d[sample_idx, :, query_idx], weights=weights[sample_idx, :, query_idx], score=np.asarray(query_score_values[sample_idx, query_idx], dtype=np.float32), label=np.asarray(query_labels[sample_idx, query_idx], dtype=np.int64))
+            for view_idx, view_img in enumerate(view_images):
+                if view_idx >= points_2d.shape[1]:
+                    break
+                camera_name = _camera_name_from_filename(filenames[view_idx], view_idx) if isinstance(filenames, (list, tuple)) and view_idx < len(filenames) else f'camera_{view_idx}'
+                stem = osp.splitext(osp.basename(filenames[view_idx]))[0] if isinstance(filenames, (list, tuple)) and view_idx < len(filenames) else f'view{view_idx}'
+                camera_dir = osp.join(query_dir, camera_name)
+                mmcv.mkdir_or_exist(camera_dir)
+                canvas = view_img.copy()
+                ref_proj = _project_points_to_image(reference_points[sample_idx, query_idx:query_idx + 1], lidar2img[view_idx])
+                if ref_proj.shape[0] > 0 and ref_proj[0, 2] > 0:
+                    cx, cy = int(round(ref_proj[0, 0])), int(round(ref_proj[0, 1]))
+                    if 0 <= cx < canvas.shape[1] and 0 <= cy < canvas.shape[0]:
+                        cv2.drawMarker(canvas, (cx, cy), (255, 255, 255), markerType=cv2.MARKER_CROSS, markerSize=18, thickness=2)
+                for level_idx in range(num_levels):
+                    color = palette[level_idx % len(palette)]
+                    level_weights = weights[sample_idx, view_idx, query_idx, level_idx]
+                    level_points = points_2d[sample_idx, view_idx, query_idx]
+                    for point_idx in range(min(num_pts, level_points.shape[0])):
+                        px = int(round(level_points[point_idx, 0] * canvas.shape[1]))
+                        py = int(round(level_points[point_idx, 1] * canvas.shape[0]))
+                        if not (0 <= px < canvas.shape[1] and 0 <= py < canvas.shape[0]):
+                            continue
+                        weight = float(level_weights[point_idx])
+                        radius = max(3, min(10, int(round(3 + 10 * weight))))
+                        draw_color = tuple(int(min(255, max(0, c * (0.35 + 0.65 * weight)))) for c in color)
+                        cv2.circle(canvas, (px, py), radius, draw_color, -1)
+                        cv2.circle(canvas, (px, py), radius + 1, (0, 0, 0), 1)
+                        cv2.putText(canvas, str(point_idx), (px + 2, py - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.32, draw_color, 1, cv2.LINE_AA)
+                _draw_text_with_outline(canvas, f'q={query_idx} {_class_name(class_names, int(query_labels[sample_idx, query_idx]))} score={float(query_score_values[sample_idx, query_idx]):.2f}', (8, 18), (255, 255, 255))
+                mmcv.imwrite(canvas, osp.join(camera_dir, f'{sample_name}_{stem}_deform_attn.jpg'))
+                saved = True
+    return saved
+
+
 def _boxes3d_centers_numpy(boxes_3d):
     if boxes_3d is None:
         return np.empty((0, 3), dtype=np.float32)
@@ -937,10 +1178,12 @@ def _run_show_results(model, data, result, show, show_dir, rank, class_names=Non
         return
 
     debug_saved = _save_vehicle_kinematics_debug(model, data, show_dir, rank, class_names=class_names)
+    roi_saved = _save_depth_and_yolo_debug(model, data, show_dir, rank, class_names=class_names)
+    deform_saved = _save_deformable_attention_debug(model, data, show_dir, rank, class_names=class_names)
 
     vis_result = _to_visual_results(result)
     if vis_result is None:
-        if debug_saved:
+        if debug_saved or roi_saved or deform_saved:
             return
         warnings.warn('Unable to map prediction result to visualization format.')
         return
@@ -957,7 +1200,7 @@ def _run_show_results(model, data, result, show, show_dir, rank, class_names=Non
             dataset=dataset,
             show_gt=show_gt,
             dataset_start_index=dataset_start_index,
-        ):
+        ) or roi_saved or deform_saved:
             return
         warnings.warn('`--show`/`--show-dir` requested but model has no show_results method.')
         return
@@ -996,7 +1239,7 @@ def _run_show_results(model, data, result, show, show_dir, rank, class_names=Non
                     dataset=dataset,
                     show_gt=show_gt,
                     dataset_start_index=dataset_start_index,
-                ) or debug_saved:
+                ) or debug_saved or roi_saved or deform_saved:
                     return
             raise
 
@@ -1009,7 +1252,7 @@ def _run_show_results(model, data, result, show, show_dir, rank, class_names=Non
         dataset=dataset,
         show_gt=show_gt,
         dataset_start_index=dataset_start_index,
-    ) or debug_saved:
+    ) or debug_saved or roi_saved or deform_saved:
         return
 
     warnings.warn(
